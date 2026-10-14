@@ -1,0 +1,35 @@
+[package]
+name = "WhattyTheShell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# v4_14 is required for GdkDmabufTexture (zero-copy wgpu → GTK frames)
+gtk4 = { version = "0.11", features = ["v4_14"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+# Directory helper for config paths
+dirs-next = "2.0"
+
+# Terminal core
+vte = "0.15"
+libc = "0.2"
+wgpu = "30"
+ash = "0.38"
+swash = "0.2"
+fontdb = "0.24"
+bytemuck = { version = "1.25", features = ["derive"] }
+async-channel = "2.3"
+pollster = "0.4"
+zip = "8.6.0"
+
+[features]
+default = ["vulkan"]
+vulkan = []
+opengl = []
+
+[dev-dependencies]
+image = "0.25.10"
