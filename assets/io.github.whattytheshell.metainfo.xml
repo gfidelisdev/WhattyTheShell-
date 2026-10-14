@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.whattytheshell</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>WhattyTheShell!</name>
+  <summary>GTK4 GPU-accelerated terminal emulator with Vulkan rendering</summary>
+  <url type="homepage">https://github.com/gfidelis/WhattyTheShell</url>
+  <developer id="io.github.whattytheshell">
+    <name>WhattyTheShell Contributors</name>
+  </developer>
+  <description>
+    <p>
+      WhattyTheShell is a fast, GPU-accelerated terminal emulator built with GTK4 and Rust.
+      It features zero-copy Vulkan dmabuf texture sharing, horizontal and vertical tabs,
+      full VT100/Xterm emulation, and VS Code theme integration.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.whattytheshell.desktop</launchable>
+  <provides>
+    <binary>whatty</binary>
+    <binary>wts</binary>
+    <binary>whattytheshell</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+</component>

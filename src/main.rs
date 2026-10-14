@@ -32,7 +32,7 @@ use widget::TerminalView;
 fn main() {
     // Initialise GTK application
     let app = Application::builder()
-        .application_id("com.example.whattytheshell")
+        .application_id("io.github.whattytheshell")
         .build();
 
     // Load user configuration

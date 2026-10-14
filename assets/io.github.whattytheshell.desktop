@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WhattyTheShell!
+GenericName=Terminal Emulator
+Comment=GTK4 GPU-accelerated terminal emulator with Vulkan rendering
+Exec=whatty %U
+Icon=io.github.whattytheshell
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=whatty;whatyy;whattytheshell;whattheshell;wts;terminal;shell;
+StartupWMClass=io.github.whattytheshell
+StartupNotify=true

@@ -2,6 +2,10 @@
 name = "WhattyTheShell"
 version = "0.1.0"
 edition = "2021"
+description = "GTK4 GPU-accelerated terminal emulator with Vulkan rendering"
+license = "MIT"
+authors = ["WhattyTheShell Contributors"]
+repository = "https://github.com/gfidelis/WhattyTheShell"
 
 [dependencies]
 # v4_14 is required for GdkDmabufTexture (zero-copy wgpu → GTK frames)
@@ -33,3 +37,56 @@ opengl = []
 
 [dev-dependencies]
 image = "0.25.10"
+
+[package.metadata.deb]
+name = "whattytheshell"
+maintainer = "WhattyTheShell Contributors <noreply@github.com>"
+copyright = "2026 WhattyTheShell Contributors"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+WhattyTheShell is a modern GTK4 terminal emulator featuring zero-copy Vulkan \
+dmabuf rendering, tab management, and VS Code themes."""
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1 (>= 4.14), libvulkan1"
+assets = [
+    ["target/release/WhattyTheShell", "usr/bin/whatty", "755"],
+    ["assets/io.github.whattytheshell.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/hicolor/16x16/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["assets/icons/hicolor/24x24/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["assets/icons/hicolor/32x32/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["assets/icons/hicolor/48x48/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["assets/icons/hicolor/64x64/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["assets/icons/hicolor/128x128/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["assets/icons/hicolor/256x256/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["assets/icons/hicolor/512x512/apps/io.github.whattytheshell.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]
+[package.metadata.deb.symlinks]
+"usr/bin/whatyy" = "whatty"
+"usr/bin/whattytheshell" = "whatty"
+"usr/bin/whattheshell" = "whatty"
+"usr/bin/wts" = "whatty"
+"usr/bin/WhattyTheShell" = "whatty"
+
+[package.metadata.generate-rpm]
+name = "whattytheshell"
+summary = "GTK4 GPU-accelerated terminal emulator with Vulkan rendering"
+license = "MIT"
+assets = [
+    { source = "target/release/WhattyTheShell", dest = "/usr/bin/whatty", mode = "755" },
+    { source = "assets/io.github.whattytheshell.desktop", dest = "/usr/share/applications/io.github.whattytheshell.desktop", mode = "644" },
+    { source = "assets/icons/hicolor/16x16/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/24x24/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/32x32/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/48x48/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/64x64/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/128x128/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/256x256/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "assets/icons/hicolor/512x512/apps/io.github.whattytheshell.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.whattytheshell.png", mode = "644" },
+    { source = "/usr/bin/whatty", dest = "/usr/bin/whatyy", mode = "symlink" },
+    { source = "/usr/bin/whatty", dest = "/usr/bin/whattytheshell", mode = "symlink" },
+    { source = "/usr/bin/whatty", dest = "/usr/bin/whattheshell", mode = "symlink" },
+    { source = "/usr/bin/whatty", dest = "/usr/bin/wts", mode = "symlink" },
+    { source = "/usr/bin/whatty", dest = "/usr/bin/WhattyTheShell", mode = "symlink" },
+]
+requires = { "gtk4" = ">= 4.14", "vulkan-loader" = "*" }

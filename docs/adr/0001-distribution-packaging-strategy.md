@@ -1,0 +1,3 @@
+# Distribution Packaging Strategy
+
+We need to distribute WhattyTheShell across multiple Linux formats (DEB, RPM, AppImage, and Tarball with installer) via automated GitHub Releases. We decided to use declarative metadata in `Cargo.toml` (`cargo-deb` and `cargo-generate-rpm`) for DEB/RPM, a custom `AppDir`/`AppRun` script for AppImage to delegate GPU/Vulkan drivers directly to the host system, and a dual-privilege `install.sh` for the Tarball. This avoids driver breakage with GTK 4.14+ and Vulkan, keeps package metadata centralized in Rust, and provides seamless desktop menu integration with aliases (`whatty`, `whatyy`, `whattytheshell`, `whattheshell`, `wts`).
