@@ -27,11 +27,61 @@ pub struct GlyphInstance {
     pub color: [f32; 4], // RGBA
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub start: (usize, usize), // (row, col)
+    pub end: (usize, usize),   // (row, col)
+}
+
+impl SelectionRange {
+    pub fn new(start: (usize, usize), end: (usize, usize)) -> Self {
+        Self { start, end }
+    }
+
+    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        if self.start <= self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        let (s, e) = self.normalized();
+        if row < s.0 || row > e.0 {
+            return false;
+        }
+        if s.0 == e.0 {
+            col >= s.1 && col <= e.1
+        } else if row == s.0 {
+            col >= s.1
+        } else if row == e.0 {
+            col <= e.1
+        } else {
+            true
+        }
+    }
+}
+
+pub fn boost_saturation(rgba: [f32; 4], factor: f32) -> [f32; 4] {
+    if (factor - 1.0).abs() < 0.001 {
+        return rgba;
+    }
+    let l = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2];
+    [
+        (l + (rgba[0] - l) * factor).clamp(0.0, 1.0),
+        (l + (rgba[1] - l) * factor).clamp(0.0, 1.0),
+        (l + (rgba[2] - l) * factor).clamp(0.0, 1.0),
+        rgba[3],
+    ]
+}
+
 #[derive(Clone, Debug)]
 pub struct Palette {
     pub bg: [f32; 4],
     pub fg: [f32; 4],
     pub cursor: [f32; 4],
+    pub selection: [f32; 4],
     pub ansi: [(u8, u8, u8); 16],
 }
 
@@ -41,6 +91,7 @@ impl Default for Palette {
             bg: [0.118, 0.118, 0.118, 1.0], // #1e1e1e
             fg: [0.800, 0.800, 0.800, 1.0], // #cccccc
             cursor: [0.900, 0.900, 0.900, 0.75],
+            selection: [0.22, 0.45, 0.85, 0.50], // Semi-transparent blue highlight
             ansi: [
                 (0, 0, 0),       // 0: Black
                 (205, 49, 49),   // 1: Red
@@ -92,6 +143,9 @@ pub fn palette_from_vscode_colors(colors: &std::collections::HashMap<String, Str
     if let Some(cur) = colors.get("terminalCursor.foreground").or_else(|| colors.get("editorCursor.foreground")) {
         if let Some(c) = hex_to_rgba(cur) { p.cursor = c; }
     }
+    if let Some(sel) = colors.get("terminal.selectionBackground").or_else(|| colors.get("editor.selectionBackground")) {
+        if let Some(c) = hex_to_rgba(sel) { p.selection = c; }
+    }
     let ansi_keys = [
         "terminal.ansiBlack", "terminal.ansiRed", "terminal.ansiGreen", "terminal.ansiYellow",
         "terminal.ansiBlue", "terminal.ansiMagenta", "terminal.ansiCyan", "terminal.ansiWhite",
@@ -123,6 +177,8 @@ pub struct TerminalRenderer {
     pub atlas_bind_group_layout: wgpu::BindGroupLayout,
 
     pub palette: Palette,
+
+    pub saturation_boost: f32,
 
     max_cells: usize,
 }
@@ -356,7 +412,7 @@ impl TerminalRenderer {
                 entry_point: Some("fs_bg"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -449,8 +505,13 @@ impl TerminalRenderer {
             atlas_bind_group,
             atlas_bind_group_layout,
             palette: Palette::default(),
+            saturation_boost: 1.0,
             max_cells,
         })
+    }
+
+    pub fn set_saturation_boost(&mut self, boost: f32) {
+        self.saturation_boost = boost;
     }
 
     pub fn update_font(
@@ -495,6 +556,8 @@ impl TerminalRenderer {
         grid: &Grid,
         cursor: &crate::term::Cursor,
         cursor_visible: bool,
+        selection: Option<&SelectionRange>,
+        hovered_link: Option<&((usize, usize), (usize, usize))>,
     ) {
         let uniforms = Uniforms {
             screen_size: [width as f32, height as f32],
@@ -509,8 +572,16 @@ impl TerminalRenderer {
         let mut bg_instances = Vec::with_capacity(grid.rows * grid.cols);
         let mut glyph_instances = Vec::with_capacity(grid.rows * grid.cols);
 
-        let default_bg = self.palette.bg;
-        let default_fg = self.palette.fg;
+        let default_bg = if self.saturation_boost > 1.0 {
+            boost_saturation(self.palette.bg, self.saturation_boost)
+        } else {
+            self.palette.bg
+        };
+        let default_fg = if self.saturation_boost > 1.0 {
+            boost_saturation(self.palette.fg, self.saturation_boost)
+        } else {
+            self.palette.fg
+        };
 
         // 1. Draw entire background rect
         bg_instances.push(BgInstance {
@@ -530,8 +601,23 @@ impl TerminalRenderer {
                     break;
                 }
 
+                let is_selected = selection.map(|s| s.contains(r, c)).unwrap_or(false);
+                let is_link = hovered_link.map(|(s, e)| {
+                    if r < s.0 || r > e.0 {
+                        false
+                    } else if s.0 == e.0 {
+                        c >= s.1 && c <= e.1
+                    } else if r == s.0 {
+                        c >= s.1
+                    } else if r == e.0 {
+                        c <= e.1
+                    } else {
+                        true
+                    }
+                }).unwrap_or(false);
+
                 let is_inverse = (cell.flags & flags::INVERSE) != 0;
-                let (fg_color, bg_color) = if is_inverse {
+                let (mut fg_color, mut bg_color) = if is_inverse {
                     (
                         resolve_color(cell.bg, default_bg, default_fg, &self.palette.ansi, false),
                         resolve_color(cell.fg, default_bg, default_fg, &self.palette.ansi, true),
@@ -543,6 +629,11 @@ impl TerminalRenderer {
                     )
                 };
 
+                if self.saturation_boost > 1.0 {
+                    fg_color = boost_saturation(fg_color, self.saturation_boost);
+                    bg_color = boost_saturation(bg_color, self.saturation_boost);
+                }
+
                 // Non-default background cell
                 if cell.bg != Color::Default || is_inverse {
                     bg_instances.push(BgInstance {
@@ -551,9 +642,26 @@ impl TerminalRenderer {
                     });
                 }
 
+                // Selection highlight
+                if is_selected {
+                    let sel_color = if self.saturation_boost > 1.0 {
+                        boost_saturation(self.palette.selection, self.saturation_boost)
+                    } else {
+                        self.palette.selection
+                    };
+                    bg_instances.push(BgInstance {
+                        rect: [x, y, cell_w, cell_h],
+                        color: sel_color,
+                    });
+                }
+
                 // Glyph
                 if cell.c != ' ' && cell.c != '\0' {
-                    let info = self.atlas.get_or_insert(queue, cell.c, cell.flags);
+                    let mut cell_flags = cell.flags;
+                    if is_link {
+                        cell_flags |= flags::UNDERLINE;
+                    }
+                    let info = self.atlas.get_or_insert(queue, cell.c, cell_flags);
                     if info.size[0] > 0.0 && info.size[1] > 0.0 {
                         let glyph_x = x + info.offset[0];
                         let glyph_y = y + (ascent - info.offset[1]);
@@ -741,6 +849,8 @@ mod tests {
             term.grid(),
             &term.state.cursor,
             true,
+            None,
+            None,
         );
 
         let tilde_info = renderer.atlas.cache.get(&('~', 0)).expect("tilde not cached");
@@ -848,7 +958,7 @@ mod tests {
         term.advance("Original Text".as_bytes());
 
         // First render pass
-        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true);
+        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, None, None);
 
         // Update font family and size
         renderer.update_font(&device, &queue, Some("Liberation Mono"), 18.0).unwrap();
@@ -856,9 +966,39 @@ mod tests {
         term.advance("\nUpdated Font Text".as_bytes());
 
         // Second render pass with updated font
-        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true);
+        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, None, None);
 
         assert_eq!(renderer.atlas.font_size, 18.0);
+    }
+
+    #[test]
+    fn test_selection_range_contains_and_normalization() {
+        let sel = SelectionRange {
+            start: (2, 5),
+            end: (1, 10),
+        };
+        let (s, e) = sel.normalized();
+        assert_eq!(s, (1, 10));
+        assert_eq!(e, (2, 5));
+
+        assert!(sel.contains(1, 10));
+        assert!(sel.contains(1, 15));
+        assert!(sel.contains(2, 0));
+        assert!(sel.contains(2, 5));
+        assert!(!sel.contains(1, 9));
+        assert!(!sel.contains(2, 6));
+        assert!(!sel.contains(0, 5));
+        assert!(!sel.contains(3, 0));
+    }
+
+    #[test]
+    fn test_boost_saturation() {
+        let original = [0.2, 0.4, 0.8, 1.0];
+        let boosted = boost_saturation(original, 1.5);
+        assert_eq!(boosted[3], 1.0); // alpha unchanged
+        // Saturation factor 1.5 increases distance from luminance
+        assert!(boosted[2] > original[2]);
+        assert!(boosted[0] <= original[0]);
     }
 }
 

@@ -62,6 +62,30 @@ pub struct Config {
     /// Open tabs persisted from previous session.
     #[serde(default)]
     pub open_tabs: Vec<SavedTab>,
+
+    /// Active tab index persisted from previous session.
+    #[serde(default)]
+    pub active_tab_index: Option<usize>,
+
+    /// Window opacity level (0.20 to 1.0).
+    #[serde(default = "default_opacity")]
+    pub window_opacity: f32,
+
+    /// Allow adjusting opacity with Ctrl + mouse scroll wheel.
+    #[serde(default = "default_true")]
+    pub ctrl_scroll_opacity: bool,
+
+    /// Experimental: allow opacity/saturation slider to exceed 100% and supersaturate colors.
+    #[serde(default = "default_false")]
+    pub experimental_supersaturation: bool,
+
+    /// Color saturation boost factor (1.0 to 2.0).
+    #[serde(default = "default_saturation")]
+    pub color_saturation: f32,
+
+    /// Double-click tab header closes tab.
+    #[serde(default = "default_true")]
+    pub double_click_close_tab: bool,
 }
 
 fn default_orientation() -> TabOrientation {
@@ -70,6 +94,22 @@ fn default_orientation() -> TabOrientation {
 
 fn default_font_size() -> f32 {
     14.0
+}
+
+fn default_opacity() -> f32 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_saturation() -> f32 {
+    1.0
 }
 
 impl Default for Config {
@@ -83,6 +123,12 @@ impl Default for Config {
             font_family: None,
             font_size: default_font_size(),
             open_tabs: Vec::new(),
+            active_tab_index: None,
+            window_opacity: default_opacity(),
+            ctrl_scroll_opacity: default_true(),
+            experimental_supersaturation: default_false(),
+            color_saturation: default_saturation(),
+            double_click_close_tab: default_true(),
         }
     }
 }
@@ -177,6 +223,60 @@ impl ConfigManager {
         self.config.open_tabs = tabs;
         let _ = self.save();
     }
+
+    pub fn active_tab_index(&self) -> Option<usize> {
+        self.config.active_tab_index
+    }
+
+    pub fn set_active_tab_index(&mut self, idx: Option<usize>) {
+        self.config.active_tab_index = idx;
+        let _ = self.save();
+    }
+
+    pub fn window_opacity(&self) -> f32 {
+        self.config.window_opacity
+    }
+
+    pub fn set_window_opacity(&mut self, opacity: f32) {
+        self.config.window_opacity = opacity.clamp(0.20, 1.0);
+        let _ = self.save();
+    }
+
+    pub fn ctrl_scroll_opacity(&self) -> bool {
+        self.config.ctrl_scroll_opacity
+    }
+
+    pub fn set_ctrl_scroll_opacity(&mut self, val: bool) {
+        self.config.ctrl_scroll_opacity = val;
+        let _ = self.save();
+    }
+
+    pub fn experimental_supersaturation(&self) -> bool {
+        self.config.experimental_supersaturation
+    }
+
+    pub fn set_experimental_supersaturation(&mut self, val: bool) {
+        self.config.experimental_supersaturation = val;
+        let _ = self.save();
+    }
+
+    pub fn color_saturation(&self) -> f32 {
+        self.config.color_saturation
+    }
+
+    pub fn set_color_saturation(&mut self, val: f32) {
+        self.config.color_saturation = val.clamp(1.0, 2.0);
+        let _ = self.save();
+    }
+
+    pub fn double_click_close_tab(&self) -> bool {
+        self.config.double_click_close_tab
+    }
+
+    pub fn set_double_click_close_tab(&mut self, val: bool) {
+        self.config.double_click_close_tab = val;
+        let _ = self.save();
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +299,32 @@ mod tests {
         assert_eq!(parsed.open_tabs[0].working_dir, Some(PathBuf::from("/home/user/project")));
         assert_eq!(parsed.font_family, Some("Fira Code".into()));
         assert_eq!(parsed.font_size, 16.0);
+    }
+
+    #[test]
+    fn test_config_window_and_ergonomics_options() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.window_opacity, 1.0);
+        assert!(cfg.ctrl_scroll_opacity);
+        assert!(!cfg.experimental_supersaturation);
+        assert_eq!(cfg.color_saturation, 1.0);
+        assert!(cfg.double_click_close_tab);
+
+        cfg.active_tab_index = Some(2);
+        cfg.window_opacity = 0.85;
+        cfg.ctrl_scroll_opacity = false;
+        cfg.experimental_supersaturation = true;
+        cfg.color_saturation = 1.35;
+        cfg.double_click_close_tab = false;
+
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(parsed.active_tab_index, Some(2));
+        assert_eq!(parsed.window_opacity, 0.85);
+        assert!(!parsed.ctrl_scroll_opacity);
+        assert!(parsed.experimental_supersaturation);
+        assert_eq!(parsed.color_saturation, 1.35);
+        assert!(!parsed.double_click_close_tab);
     }
 }

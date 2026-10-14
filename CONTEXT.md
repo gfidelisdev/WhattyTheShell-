@@ -52,3 +52,39 @@ _Avoid_: Build output, raw binary
 A shell script bundled with a compressed archive that detects system or user privileges and deploys application binaries, aliases, icons, and desktop entries.
 _Avoid_: Setup wizard, installer executable
 
+## Text Interaction & Ergonomics
+
+Manages grid text selection, clipboard synchronization, hyperlink activation, and window transparency controls.
+
+**Text Selection**:
+The continuous sequence of terminal cells marked by mouse drag, word double-click, or line triple-click for clipboard copying.
+_Avoid_: Highlighted text, marked block
+
+**Primary Selection**:
+The system selection buffer populated immediately upon text selection, pasted via middle mouse click without modifier keys.
+_Avoid_: Auto-clipboard, mouse buffer
+
+**Bracketed Paste**:
+A terminal protocol sequence enclosing pasted text within escape codes to safeguard against unintended command execution in interactive shells.
+_Avoid_: Safe paste, raw paste
+
+**Hyperlink Activation**:
+The detection and opening of URLs in the default system browser triggered by modifier-click on recognized terminal text.
+_Avoid_: Link parsing, web click
+
+**Window Opacity**:
+The visual transparency level of the terminal window, adjustable via modifier-scroll gesture or settings preferences down to a 20% floor.
+_Avoid_: Alpha level, window see-through
+
+**Color Supersaturation**:
+An experimental rendering enhancement boosting color saturation and vibrance beyond standard limits when values exceed 100%.
+_Avoid_: Color overdrive, brightness boost
+
+**Tab Renaming**:
+The custom alphanumeric label assigned by the user to identify an individual terminal tab session.
+_Avoid_: Tab title change, header edit
+
+**Tab Duplication**:
+The creation of a new terminal tab session that inherits the exact working directory of an existing tab.
+_Avoid_: Tab clone, replicate tab
+

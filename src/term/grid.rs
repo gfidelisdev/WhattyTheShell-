@@ -158,4 +158,126 @@ impl Grid {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// Extract text from the given selection span (inclusive of start and end cells).
+    pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (s, e) = if start <= end { (start, end) } else { (end, start) };
+        if self.lines.is_empty() || self.cols == 0 || s.0 >= self.rows {
+            return String::new();
+        }
+
+        let e_row = e.0.min(self.rows - 1);
+        let mut result = Vec::new();
+
+        for r in s.0..=e_row {
+            let row = &self.lines[r];
+            let col_start = if r == s.0 { s.1.min(self.cols - 1) } else { 0 };
+            let col_end = if r == e_row { e.1.min(self.cols - 1) } else { self.cols - 1 };
+
+            if col_start <= col_end {
+                let line_str: String = row[col_start..=col_end]
+                    .iter()
+                    .map(|c| if c.c == '\0' { ' ' } else { c.c })
+                    .collect();
+                if r == e_row {
+                    result.push(line_str.trim_end().to_string());
+                } else {
+                    result.push(line_str.trim_end().to_string());
+                }
+            } else {
+                result.push(String::new());
+            }
+        }
+
+        result.join("\n")
+    }
+
+    /// Find word boundaries around the given cell (for double-click word selection).
+    pub fn word_at(&self, row: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+
+        let cells = &self.lines[row];
+        let target_char = cells[col].c;
+        if target_char == ' ' || target_char == '\0' {
+            return None;
+        }
+
+        fn is_word_char(c: char) -> bool {
+            !c.is_whitespace()
+                && c != '\0'
+                && c != '"'
+                && c != '\''
+                && c != '`'
+                && c != '('
+                && c != ')'
+                && c != '['
+                && c != ']'
+                && c != '{'
+                && c != '}'
+                && c != '<'
+                && c != '>'
+        }
+
+        let mut start_col = col;
+        while start_col > 0 && is_word_char(cells[start_col - 1].c) {
+            start_col -= 1;
+        }
+
+        let mut end_col = col;
+        while end_col + 1 < self.cols && is_word_char(cells[end_col + 1].c) {
+            end_col += 1;
+        }
+
+        Some(((row, start_col), (row, end_col)))
+    }
+
+    /// Find an HTTP/HTTPS URL at the specified cell (for Ctrl + click hyperlink activation).
+    pub fn url_at(&self, row: usize, col: usize) -> Option<(String, ((usize, usize), (usize, usize)))> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+
+        let line_chars: Vec<char> = self.lines[row]
+            .iter()
+            .map(|c| if c.c == '\0' { ' ' } else { c.c })
+            .collect();
+        let line_str: String = line_chars.iter().collect();
+
+        for prefix in ["https://", "http://"] {
+            let mut search_idx = 0;
+            while let Some(start_pos) = line_str[search_idx..].find(prefix) {
+                let actual_start = search_idx + start_pos;
+                let mut actual_end = actual_start;
+
+                while actual_end < line_str.len() {
+                    let ch = line_chars[actual_end];
+                    if ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == '(' || ch == ')' || ch == '[' || ch == ']' {
+                        break;
+                    }
+                    actual_end += 1;
+                }
+
+                // Trim trailing punctuation like '.', ',', ';', ':'
+                while actual_end > actual_start {
+                    let last_ch = line_chars[actual_end - 1];
+                    if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == ':' {
+                        actual_end -= 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if col >= actual_start && col < actual_end {
+                    let url: String = line_chars[actual_start..actual_end].iter().collect();
+                    return Some((url, ((row, actual_start), (row, actual_end - 1))));
+                }
+
+                search_idx = actual_start + prefix.len();
+            }
+        }
+
+        None
+    }
 }

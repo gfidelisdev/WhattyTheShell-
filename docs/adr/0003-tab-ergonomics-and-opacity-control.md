@@ -1,0 +1,3 @@
+# Tab Ergonomics and Opacity Control Strategy
+
+We need robust tab renaming, session focus retention, tab context menu operations (duplicate, copy path, close, close others), and dependable window opacity adjustment via mouse wheel. We decided to implement inline header renaming toggling an entry widget on Ctrl+click or context menu, a secondary-click popover menu for tab management, persistent active tab index tracking with idle-dispatched terminal focus on startup, and a window-level discrete scroll controller enforcing a 20% opacity floor. This ensures intuitive tab workflow and reliable multi-monitor and wheel-scroll interactions across Wayland and X11 sessions.

@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{
     glib, Align, ApplicationWindow, Box as GtkBox, Button, DrawingArea,
     Entry, Frame, GestureClick, Label, ListBox, ListBoxRow, Notebook, Orientation,
-    ProgressBar, ScrolledWindow, SearchEntry, SpinButton, Stack, StackSwitcher,
+    ProgressBar, Scale, ScrolledWindow, SearchEntry, SpinButton, Stack, StackSwitcher,
     Switch, Window,
 };
 
@@ -239,6 +239,7 @@ pub fn open_settings_dialog(
     let mono_label = Label::new(Some("Only Monospaced:"));
     let mono_switch = Switch::new();
     mono_switch.set_active(true);
+    mono_switch.set_valign(Align::Center);
 
     font_controls.append(&font_search);
     font_controls.append(&mono_label);
@@ -890,10 +891,16 @@ pub fn open_settings_dialog(
     stack.add_titled(&marketplace_box, Some("themes"), "VS Code Themes");
 
     // ==========================================
-    // TAB 3: Tabs & Layout
+    // TAB 3: Window & Tabs Ergonomics
     // ==========================================
     let tabs_box = GtkBox::new(Orientation::Vertical, 16);
     tabs_box.set_margin_top(12);
+
+    // Section 1: Navigation & Tabs
+    let tab_section_title = Label::new(Some("Tabs & Layout"));
+    tab_section_title.set_halign(Align::Start);
+    tab_section_title.add_css_class("heading");
+    tabs_box.append(&tab_section_title);
 
     let orient_row = GtkBox::new(Orientation::Horizontal, 12);
     let orient_label = Label::new(Some("Vertical Tabs Layout"));
@@ -903,6 +910,7 @@ pub fn open_settings_dialog(
     let orient_switch = Switch::new();
     let is_vert = notebook.tab_pos() == gtk4::PositionType::Left;
     orient_switch.set_active(is_vert);
+    orient_switch.set_valign(Align::Center);
 
     let nb_for_orient = notebook.clone();
     let cfg_for_orient = config_manager.clone();
@@ -920,7 +928,181 @@ pub fn open_settings_dialog(
     orient_row.append(&orient_switch);
     tabs_box.append(&orient_row);
 
-    stack.add_titled(&tabs_box, Some("layout"), "Layout");
+    // Double-click close tab switch
+    let dbl_close_row = GtkBox::new(Orientation::Horizontal, 12);
+    let dbl_close_label_box = GtkBox::new(Orientation::Vertical, 2);
+    dbl_close_label_box.set_hexpand(true);
+    let dbl_close_title = Label::new(Some("Close tab with double click"));
+    dbl_close_title.set_halign(Align::Start);
+    let dbl_close_desc = Label::new(Some("Double-click a tab header to close it; double-click empty space beside tabs to open a new tab"));
+    dbl_close_desc.set_halign(Align::Start);
+    dbl_close_desc.add_css_class("dim-label");
+    dbl_close_label_box.append(&dbl_close_title);
+    dbl_close_label_box.append(&dbl_close_desc);
+
+    let dbl_close_switch = Switch::new();
+    dbl_close_switch.set_active(config_manager.borrow().double_click_close_tab());
+    dbl_close_switch.set_valign(Align::Center);
+    let cfg_for_dbl_close = config_manager.clone();
+    dbl_close_switch.connect_active_notify(move |sw| {
+        cfg_for_dbl_close.borrow_mut().set_double_click_close_tab(sw.is_active());
+    });
+    dbl_close_row.append(&dbl_close_label_box);
+    dbl_close_row.append(&dbl_close_switch);
+    tabs_box.append(&dbl_close_row);
+
+    // Section 2: Transparency & Color Saturation
+    let win_section_title = Label::new(Some("Window Transparency & Colors"));
+    win_section_title.set_halign(Align::Start);
+    win_section_title.add_css_class("heading");
+    tabs_box.append(&win_section_title);
+
+    // Ctrl + Scroll toggle
+    let scroll_opacity_row = GtkBox::new(Orientation::Horizontal, 12);
+    let scroll_opacity_label_box = GtkBox::new(Orientation::Vertical, 2);
+    scroll_opacity_label_box.set_hexpand(true);
+    let scroll_opacity_title = Label::new(Some("Adjust opacity with Ctrl + Mouse Wheel"));
+    scroll_opacity_title.set_halign(Align::Start);
+    let scroll_opacity_desc = Label::new(Some("Scroll up to increase opacity, scroll down to decrease opacity (20% floor)"));
+    scroll_opacity_desc.set_halign(Align::Start);
+    scroll_opacity_desc.add_css_class("dim-label");
+    scroll_opacity_label_box.append(&scroll_opacity_title);
+    scroll_opacity_label_box.append(&scroll_opacity_desc);
+
+    let scroll_opacity_switch = Switch::new();
+    scroll_opacity_switch.set_active(config_manager.borrow().ctrl_scroll_opacity());
+    scroll_opacity_switch.set_valign(Align::Center);
+    let cfg_for_scroll_opacity = config_manager.clone();
+    scroll_opacity_switch.connect_active_notify(move |sw| {
+        cfg_for_scroll_opacity.borrow_mut().set_ctrl_scroll_opacity(sw.is_active());
+    });
+    scroll_opacity_row.append(&scroll_opacity_label_box);
+    scroll_opacity_row.append(&scroll_opacity_switch);
+    tabs_box.append(&scroll_opacity_row);
+
+    // Experimental supersaturation toggle
+    let exp_sat_row = GtkBox::new(Orientation::Horizontal, 12);
+    let exp_sat_label_box = GtkBox::new(Orientation::Vertical, 2);
+    exp_sat_label_box.set_hexpand(true);
+    let exp_sat_title = Label::new(Some("Experimental: Exceed 100% opacity to supersaturate colors"));
+    exp_sat_title.set_halign(Align::Start);
+    let exp_sat_desc = Label::new(Some("Allows opacity adjustment up to 200%, boosting terminal vibrance and color saturation"));
+    exp_sat_desc.set_halign(Align::Start);
+    exp_sat_desc.add_css_class("dim-label");
+    exp_sat_label_box.append(&exp_sat_title);
+    exp_sat_label_box.append(&exp_sat_desc);
+
+    let exp_sat_switch = Switch::new();
+    exp_sat_switch.set_active(config_manager.borrow().experimental_supersaturation());
+    exp_sat_switch.set_valign(Align::Center);
+    exp_sat_row.append(&exp_sat_label_box);
+    exp_sat_row.append(&exp_sat_switch);
+    tabs_box.append(&exp_sat_row);
+
+    // Opacity / Saturation Slider
+    let slider_box = GtkBox::new(Orientation::Vertical, 6);
+    let slider_header = GtkBox::new(Orientation::Horizontal, 12);
+    let slider_title = Label::new(Some("Window Opacity / Vibrance:"));
+    slider_title.set_hexpand(true);
+    slider_title.set_halign(Align::Start);
+
+    let current_level = {
+        let c = config_manager.borrow();
+        if c.experimental_supersaturation() && c.color_saturation() > 1.0 {
+            c.color_saturation()
+        } else {
+            c.window_opacity()
+        }
+    };
+    let initial_pct = (current_level * 100.0).round() as i32;
+    let value_label = Label::new(Some(&if initial_pct > 100 {
+        format!("{}% (Supersaturado)", initial_pct)
+    } else {
+        format!("{}%", initial_pct)
+    }));
+
+    slider_header.append(&slider_title);
+    slider_header.append(&value_label);
+    slider_box.append(&slider_header);
+
+    let max_val = if config_manager.borrow().experimental_supersaturation() { 200.0 } else { 100.0 };
+    let opacity_scale = Scale::with_range(Orientation::Horizontal, 20.0, max_val, 1.0);
+    opacity_scale.set_value(initial_pct as f64);
+    opacity_scale.set_hexpand(true);
+
+    let win_for_scale = parent.clone();
+    let nb_for_scale = notebook.clone();
+    let cfg_for_scale = config_manager.clone();
+    let val_label_clone = value_label.clone();
+    opacity_scale.connect_value_changed(move |scale| {
+        let pct = scale.value().round() as i32;
+        let factor = (pct as f32) / 100.0;
+        let experimental = cfg_for_scale.borrow().experimental_supersaturation();
+
+        if pct > 100 && experimental {
+            val_label_clone.set_text(&format!("{}% (Supersaturado)", pct));
+            win_for_scale.set_opacity(1.0);
+            for i in 0..nb_for_scale.n_pages() {
+                if let Some(page) = nb_for_scale.nth_page(Some(i)) {
+                    if let Ok(tv) = page.downcast::<TerminalView>() {
+                        tv.set_saturation_boost(factor);
+                    }
+                }
+            }
+            let mut c = cfg_for_scale.borrow_mut();
+            c.set_window_opacity(1.0);
+            c.set_color_saturation(factor);
+        } else {
+            val_label_clone.set_text(&format!("{}%", pct));
+            let opacity = (factor.min(1.0)).max(0.20);
+            win_for_scale.set_opacity(opacity as f64);
+            for i in 0..nb_for_scale.n_pages() {
+                if let Some(page) = nb_for_scale.nth_page(Some(i)) {
+                    if let Ok(tv) = page.downcast::<TerminalView>() {
+                        tv.set_saturation_boost(1.0);
+                    }
+                }
+            }
+            let mut c = cfg_for_scale.borrow_mut();
+            c.set_window_opacity(opacity);
+            c.set_color_saturation(1.0);
+        }
+    });
+
+    let scale_for_exp = opacity_scale.clone();
+    let win_for_exp = parent.clone();
+    let nb_for_exp = notebook.clone();
+    let cfg_for_exp = config_manager.clone();
+    let val_label_exp = value_label.clone();
+    exp_sat_switch.connect_active_notify(move |sw| {
+        let active = sw.is_active();
+        cfg_for_exp.borrow_mut().set_experimental_supersaturation(active);
+        if active {
+            scale_for_exp.set_range(20.0, 200.0);
+        } else {
+            scale_for_exp.set_range(20.0, 100.0);
+            if scale_for_exp.value() > 100.0 {
+                scale_for_exp.set_value(100.0);
+                val_label_exp.set_text("100%");
+                win_for_exp.set_opacity(1.0);
+                for i in 0..nb_for_exp.n_pages() {
+                    if let Some(page) = nb_for_exp.nth_page(Some(i)) {
+                        if let Ok(tv) = page.downcast::<TerminalView>() {
+                            tv.set_saturation_boost(1.0);
+                        }
+                    }
+                }
+                let mut c = cfg_for_exp.borrow_mut();
+                c.set_window_opacity(1.0);
+                c.set_color_saturation(1.0);
+            }
+        }
+    });
+
+    slider_box.append(&opacity_scale);
+    tabs_box.append(&slider_box);
+
+    stack.add_titled(&tabs_box, Some("layout"), "Window & Tabs");
 
     root_box.append(&stack);
     dialog.set_child(Some(&root_box));

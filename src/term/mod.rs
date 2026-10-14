@@ -96,6 +96,18 @@ impl Terminal {
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.state.responses)
     }
+
+    pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        self.state.grid().extract_text(start, end)
+    }
+
+    pub fn word_at(&self, row: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
+        self.state.grid().word_at(row, col)
+    }
+
+    pub fn url_at(&self, row: usize, col: usize) -> Option<(String, ((usize, usize), (usize, usize)))> {
+        self.state.grid().url_at(row, col)
+    }
 }
 
 impl TermState {
@@ -495,5 +507,62 @@ mod tests {
         let mut t = Terminal::new(10, 5);
         t.advance(b"\x1b[3;4H\x1b[6n");
         assert_eq!(t.take_responses(), b"\x1b[3;4R");
+    }
+
+    #[test]
+    fn test_extract_text_selection() {
+        let mut t = Terminal::new(20, 3);
+        t.advance(b"hello world\r\nsecond line here\r\nthird");
+
+        // Single line selection: "world"
+        let sel = t.extract_text((0, 6), (0, 10));
+        assert_eq!(sel, "world");
+
+        // Reverse coordinates normalized: "hello"
+        let sel_rev = t.extract_text((0, 4), (0, 0));
+        assert_eq!(sel_rev, "hello");
+
+        // Multi-line selection
+        let sel_multi = t.extract_text((0, 6), (1, 5));
+        assert_eq!(sel_multi, "world\nsecond");
+    }
+
+    #[test]
+    fn test_word_at_boundaries() {
+        let mut t = Terminal::new(30, 2);
+        t.advance(b"cargo run --release");
+
+        // Word "cargo" at col 2
+        let word1 = t.word_at(0, 2);
+        assert_eq!(word1, Some(((0, 0), (0, 4))));
+
+        // Word "run" at col 6
+        let word2 = t.word_at(0, 6);
+        assert_eq!(word2, Some(((0, 6), (0, 8))));
+
+        // Flag "--release" at col 10
+        let flag = t.word_at(0, 10);
+        assert_eq!(flag, Some(((0, 10), (0, 18))));
+
+        // Word "release" at col 13 (inside "--release")
+        let word3 = t.word_at(0, 13);
+        assert_eq!(word3, Some(((0, 10), (0, 18))));
+    }
+
+    #[test]
+    fn test_url_detection() {
+        let mut t = Terminal::new(50, 2);
+        t.advance(b"visit https://example.com/test for info");
+
+        // In URL
+        let url = t.url_at(0, 10);
+        assert!(url.is_some());
+        let (extracted_url, span) = url.unwrap();
+        assert_eq!(extracted_url, "https://example.com/test");
+        assert_eq!(span, ((0, 6), (0, 29)));
+
+        // Outside URL (col 2 is inside "visit")
+        let none_url = t.url_at(0, 2);
+        assert!(none_url.is_none());
     }
 }

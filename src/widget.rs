@@ -18,7 +18,7 @@ use gtk4::subclass::prelude::*;
 
 use crate::pty::Pty;
 use crate::render::dmabuf::DmabufFrame;
-use crate::render::pipeline::TerminalRenderer;
+use crate::render::pipeline::{SelectionRange, TerminalRenderer};
 use crate::term::Terminal;
 
 mod imp {
@@ -36,6 +36,11 @@ mod imp {
         pub scale_factor: RefCell<i32>,
         pub base_font_size: RefCell<f32>,
         pub font_family: RefCell<Option<String>>,
+        pub selection: RefCell<Option<SelectionRange>>,
+        pub hovered_link: RefCell<Option<((usize, usize), (usize, usize))>>,
+        pub hovered_url: RefCell<Option<String>>,
+        pub ctrl_pressed: RefCell<bool>,
+        pub drag_start: RefCell<Option<(usize, usize)>>,
     }
 
     #[derive(Default)]
@@ -55,9 +60,11 @@ mod imp {
             use std::sync::OnceLock;
             static SIGNALS: OnceLock<Vec<glib::subclass::Signal>> = OnceLock::new();
             SIGNALS.get_or_init(|| {
-                vec![glib::subclass::Signal::builder("child-exited")
-                    .run_last()
-                    .build()]
+                vec![
+                    glib::subclass::Signal::builder("child-exited")
+                        .run_last()
+                        .build(),
+                ]
             })
         }
 
@@ -175,6 +182,9 @@ mod imp {
             };
 
             let mut renderer = inner.renderer.borrow_mut();
+            let selection = inner.selection.borrow();
+            let hovered_link = inner.hovered_link.borrow();
+
             renderer.render(
                 &inner.device,
                 &inner.queue,
@@ -184,6 +194,8 @@ mod imp {
                 term.grid(),
                 &term.state.cursor,
                 term.state.cursor_visible,
+                selection.as_ref(),
+                hovered_link.as_ref(),
             );
 
             inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -253,6 +265,11 @@ impl TerminalView {
             scale_factor: RefCell::new(scale),
             base_font_size: RefCell::new(font_size),
             font_family: RefCell::new(font_family),
+            selection: RefCell::new(None),
+            hovered_link: RefCell::new(None),
+            hovered_url: RefCell::new(None),
+            ctrl_pressed: RefCell::new(false),
+            drag_start: RefCell::new(None),
         };
 
         widget.imp().inner.replace(Some(inner));
@@ -331,9 +348,58 @@ impl TerminalView {
         let pty_for_keys = pty.clone();
         let term_for_keys = terminal.clone();
 
+        // Setup Actions for Context Menu
+        let action_group = gtk4::gio::SimpleActionGroup::new();
+        let copy_act = gtk4::gio::SimpleAction::new("copy", None);
+        let view_copy = widget.downgrade();
+        copy_act.connect_activate(move |_, _| {
+            if let Some(w) = view_copy.upgrade() {
+                w.copy_selection();
+            }
+        });
+        action_group.add_action(&copy_act);
+
+        let paste_act = gtk4::gio::SimpleAction::new("paste", None);
+        let view_paste = widget.downgrade();
+        paste_act.connect_activate(move |_, _| {
+            if let Some(w) = view_paste.upgrade() {
+                w.paste_clipboard();
+            }
+        });
+        action_group.add_action(&paste_act);
+
+        widget.insert_action_group("term", Some(&action_group));
+
+        // Keyboard shortcuts and input
+        let widget_for_keys = widget.downgrade();
         key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
-            let mut bytes = Vec::new();
             let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+
+            if let Some(w) = widget_for_keys.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if keyval == gdk::Key::Control_L || keyval == gdk::Key::Control_R || is_ctrl {
+                        *inner.ctrl_pressed.borrow_mut() = true;
+                    }
+                }
+
+                // Ctrl+Shift+C (Copy) and Ctrl+Shift+V (Paste)
+                if is_ctrl && is_shift {
+                    match keyval {
+                        gdk::Key::C | gdk::Key::c => {
+                            w.copy_selection();
+                            return glib::Propagation::Stop;
+                        }
+                        gdk::Key::V | gdk::Key::v => {
+                            w.paste_clipboard();
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut bytes = Vec::new();
 
             match keyval {
                 gdk::Key::Return | gdk::Key::KP_Enter => bytes.extend_from_slice(b"\r"),
@@ -399,6 +465,23 @@ impl TerminalView {
             }
         });
 
+        let widget_for_key_rel = widget.downgrade();
+        key_controller.connect_key_released(move |_, keyval, _keycode, state| {
+            if keyval == gdk::Key::Control_L || keyval == gdk::Key::Control_R || !state.contains(gdk::ModifierType::CONTROL_MASK) {
+                if let Some(w) = widget_for_key_rel.upgrade() {
+                    if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                        *inner.ctrl_pressed.borrow_mut() = false;
+                        if inner.hovered_link.borrow().is_some() {
+                            *inner.hovered_link.borrow_mut() = None;
+                            *inner.hovered_url.borrow_mut() = None;
+                            w.set_cursor_from_name(Some("text"));
+                            w.queue_draw();
+                        }
+                    }
+                }
+            }
+        });
+
         widget.add_controller(key_controller);
 
         let focus_controller = gtk4::EventControllerFocus::new();
@@ -412,16 +495,160 @@ impl TerminalView {
         });
         widget.add_controller(focus_controller);
 
+        // Mouse Drag selection controller
+        let drag_controller = gtk4::GestureDrag::new();
+        drag_controller.set_button(gdk::BUTTON_PRIMARY);
+        let drag_w = widget.downgrade();
+        drag_controller.connect_drag_begin(move |_, x, y| {
+            if let Some(w) = drag_w.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if let Some(pos) = w.pixel_to_cell(x, y) {
+                        *inner.drag_start.borrow_mut() = Some(pos);
+                        *inner.selection.borrow_mut() = None;
+                        w.queue_draw();
+                    }
+                }
+            }
+        });
+
+        let drag_update_w = widget.downgrade();
+        let drag_gesture_update = drag_controller.clone();
+        drag_controller.connect_drag_update(move |_, offset_x, offset_y| {
+            if let Some(w) = drag_update_w.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if let Some(start_pos) = *inner.drag_start.borrow() {
+                        let (start_x, start_y) = drag_gesture_update.start_point().unwrap_or((0.0, 0.0));
+                        let cur_x = start_x + offset_x;
+                        let cur_y = start_y + offset_y;
+                        if let Some(cur_pos) = w.pixel_to_cell(cur_x, cur_y) {
+                            *inner.selection.borrow_mut() = Some(SelectionRange::new(start_pos, cur_pos));
+                            w.queue_draw();
+                        }
+                    }
+                }
+            }
+        });
+
+        let drag_end_w = widget.downgrade();
+        drag_controller.connect_drag_end(move |_, _, _| {
+            if let Some(w) = drag_end_w.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if let Some(sel) = *inner.selection.borrow() {
+                        if let Ok(term) = inner.terminal.lock() {
+                            let text = term.extract_text(sel.start, sel.end);
+                            if !text.is_empty() {
+                                w.display().primary_clipboard().set_text(&text);
+                            }
+                        }
+                    }
+                    *inner.drag_start.borrow_mut() = None;
+                    w.queue_draw();
+                }
+            }
+        });
+        widget.add_controller(drag_controller);
+
+        // Click controller (single, double, triple, middle, right click)
         let click_controller = gtk4::GestureClick::new();
+        click_controller.set_button(0); // Listen to all buttons
         let click_w = widget.downgrade();
         let im_for_click = im_context.clone();
-        click_controller.connect_pressed(move |_, _, _, _| {
+        click_controller.connect_pressed(move |gesture, n_press, x, y| {
+            let button = gesture.current_button();
             if let Some(w) = click_w.upgrade() {
                 w.grab_focus();
                 im_for_click.focus_in();
+
+                if button == gdk::BUTTON_PRIMARY {
+                    if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                        let is_ctrl = *inner.ctrl_pressed.borrow();
+                        if is_ctrl && n_press == 1 {
+                            if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                                if let Ok(term) = inner.terminal.lock() {
+                                    if let Some((url, _)) = term.url_at(row, col) {
+                                        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+                                            &url,
+                                            None::<&gtk4::gio::AppLaunchContext>,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        if n_press == 2 {
+                            if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                                if let Ok(term) = inner.terminal.lock() {
+                                    if let Some((start, end)) = term.word_at(row, col) {
+                                        *inner.selection.borrow_mut() = Some(SelectionRange::new(start, end));
+                                        let text = term.extract_text(start, end);
+                                        if !text.is_empty() {
+                                            w.display().primary_clipboard().set_text(&text);
+                                        }
+                                        w.queue_draw();
+                                    }
+                                }
+                            }
+                        } else if n_press >= 3 {
+                            if let Some((row, _)) = w.pixel_to_cell(x, y) {
+                                if let Ok(term) = inner.terminal.lock() {
+                                    let cols = term.grid().cols;
+                                    if cols > 0 {
+                                        *inner.selection.borrow_mut() = Some(SelectionRange::new((row, 0), (row, cols - 1)));
+                                        let text = term.extract_text((row, 0), (row, cols - 1));
+                                        if !text.is_empty() {
+                                            w.display().primary_clipboard().set_text(&text);
+                                        }
+                                        w.queue_draw();
+                                    }
+                                }
+                            }
+                        } else if n_press == 1 && !is_ctrl {
+                            if inner.drag_start.borrow().is_none() {
+                                *inner.selection.borrow_mut() = None;
+                                w.queue_draw();
+                            }
+                        }
+                    }
+                } else if button == gdk::BUTTON_MIDDLE {
+                    w.paste_primary();
+                } else if button == gdk::BUTTON_SECONDARY {
+                    w.show_context_menu(x, y);
+                }
             }
         });
         widget.add_controller(click_controller);
+
+        // Motion controller for hover link detection
+        let motion_controller = gtk4::EventControllerMotion::new();
+        let motion_w = widget.downgrade();
+        motion_controller.connect_motion(move |_, x, y| {
+            if let Some(w) = motion_w.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    let is_ctrl = *inner.ctrl_pressed.borrow();
+                    if is_ctrl {
+                        if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                            if let Ok(term) = inner.terminal.lock() {
+                                if let Some((url, span)) = term.url_at(row, col) {
+                                    w.set_cursor_from_name(Some("pointer"));
+                                    *inner.hovered_link.borrow_mut() = Some(span);
+                                    *inner.hovered_url.borrow_mut() = Some(url);
+                                    w.queue_draw();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    w.set_cursor_from_name(Some("text"));
+                    if inner.hovered_link.borrow().is_some() {
+                        *inner.hovered_link.borrow_mut() = None;
+                        *inner.hovered_url.borrow_mut() = None;
+                        w.queue_draw();
+                    }
+                }
+            }
+        });
+        widget.add_controller(motion_controller);
 
         Ok(widget)
     }
@@ -497,6 +724,100 @@ impl TerminalView {
         let inner = inner_guard.as_ref()?;
         let pty = inner.pty.lock().ok()?;
         pty.current_working_dir()
+    }
+
+    pub fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let inner_guard = self.imp().inner.borrow();
+        let inner = inner_guard.as_ref()?;
+        let scale = *inner.scale_factor.borrow() as f64;
+        let renderer = inner.renderer.borrow();
+        let cell_w = renderer.atlas.cell_width as f64;
+        let cell_h = renderer.atlas.cell_height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let px = x * scale;
+        let py = y * scale;
+        let col = (px / cell_w).floor().max(0.0) as usize;
+        let row = (py / cell_h).floor().max(0.0) as usize;
+        let term = inner.terminal.lock().ok()?;
+        let grid = term.grid();
+        let col = col.min(grid.cols.saturating_sub(1));
+        let row = row.min(grid.rows.saturating_sub(1));
+        Some((row, col))
+    }
+
+    pub fn copy_selection(&self) {
+        let inner_guard = self.imp().inner.borrow();
+        if let Some(inner) = inner_guard.as_ref() {
+            if let Some(sel) = *inner.selection.borrow() {
+                if let Ok(term) = inner.terminal.lock() {
+                    let text = term.extract_text(sel.start, sel.end);
+                    if !text.is_empty() {
+                        self.display().clipboard().set_text(&text);
+                        self.display().primary_clipboard().set_text(&text);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn paste_clipboard(&self) {
+        let pty_clone = self.imp().inner.borrow().as_ref().map(|i| (i.pty.clone(), i.terminal.clone()));
+        if let Some((pty, term)) = pty_clone {
+            self.display().clipboard().read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
+                if let Ok(Some(text)) = res {
+                    let bracketed = term.lock().map(|t| t.state.bracketed_paste).unwrap_or(false);
+                    let payload = if bracketed {
+                        format!("\x1b[200~{}\x1b[201~", text)
+                    } else {
+                        text.to_string()
+                    };
+                    if let Ok(p) = pty.lock() {
+                        let _ = p.write_all(payload.as_bytes());
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn paste_primary(&self) {
+        let pty_clone = self.imp().inner.borrow().as_ref().map(|i| (i.pty.clone(), i.terminal.clone()));
+        if let Some((pty, term)) = pty_clone {
+            self.display().primary_clipboard().read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
+                if let Ok(Some(text)) = res {
+                    let bracketed = term.lock().map(|t| t.state.bracketed_paste).unwrap_or(false);
+                    let payload = if bracketed {
+                        format!("\x1b[200~{}\x1b[201~", text)
+                    } else {
+                        text.to_string()
+                    };
+                    if let Ok(p) = pty.lock() {
+                        let _ = p.write_all(payload.as_bytes());
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn show_context_menu(&self, x: f64, y: f64) {
+        let menu = gtk4::gio::Menu::new();
+        menu.append(Some("Copiar (Ctrl+Shift+C)"), Some("term.copy"));
+        menu.append(Some("Colar (Ctrl+Shift+V)"), Some("term.paste"));
+
+        let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(self);
+        popover.set_has_arrow(false);
+        let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&rect));
+        popover.popup();
+    }
+
+    pub fn set_saturation_boost(&self, boost: f32) {
+        if let Some(inner) = self.imp().inner.borrow().as_ref() {
+            inner.renderer.borrow_mut().set_saturation_boost(boost);
+            self.queue_draw();
+        }
     }
 }
 
