@@ -77,6 +77,10 @@ mod imp {
             obj.set_hexpand(true);
             obj.set_vexpand(true);
         }
+
+        fn dispose(&self) {
+            let _ = self.inner.borrow_mut().take();
+        }
     }
 
     impl WidgetImpl for TerminalView {
@@ -185,6 +189,8 @@ mod imp {
             let selection = inner.selection.borrow();
             let hovered_link = inner.hovered_link.borrow();
 
+            let display_offset = term.display_offset();
+
             renderer.render(
                 &inner.device,
                 &inner.queue,
@@ -194,11 +200,12 @@ mod imp {
                 term.grid(),
                 &term.state.cursor,
                 term.state.cursor_visible,
+                display_offset,
                 selection.as_ref(),
                 hovered_link.as_ref(),
             );
 
-            inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let _ = inner.device.poll(wgpu::PollType::Poll);
 
             // Build GdkTexture from dmabuf
             let display = self.obj().display();
@@ -274,9 +281,9 @@ impl TerminalView {
 
         widget.imp().inner.replace(Some(inner));
 
-        // Setup background PTY reader thread
+        // Setup background PTY reader thread with a bounded channel for backpressure
         let reader = pty.lock().unwrap().reader()?;
-        let (sender, receiver) = async_channel::unbounded::<Vec<u8>>();
+        let (sender, receiver) = async_channel::bounded::<Vec<u8>>(128);
 
         thread::Builder::new()
             .name("pty-reader".into())
@@ -309,14 +316,31 @@ impl TerminalView {
 
         glib::spawn_future_local(async move {
             while let Ok(data) = receiver.recv().await {
+                let widget = match widget_weak.upgrade() {
+                    Some(w) => w,
+                    None => break,
+                };
+
                 if data.is_empty() {
-                    if let Some(w) = widget_weak.upgrade() {
-                        w.emit_by_name::<()>("child-exited", &[]);
-                    }
+                    widget.emit_by_name::<()>("child-exited", &[]);
                     break;
                 }
+
+                // Batch multiple chunks up to 64KB per iteration to minimize locking and redraw calls
+                let mut batch = data;
+                let mut had_more = false;
+                while batch.len() < 64 * 1024 {
+                    match receiver.try_recv() {
+                        Ok(more) if !more.is_empty() => {
+                            batch.extend_from_slice(&more);
+                            had_more = true;
+                        }
+                        _ => break,
+                    }
+                }
+
                 if let Ok(mut term) = term_clone.lock() {
-                    term.advance(&data);
+                    term.advance(&batch);
                     let responses = term.take_responses();
                     if !responses.is_empty() {
                         if let Ok(pty) = pty_clone.lock() {
@@ -324,8 +348,12 @@ impl TerminalView {
                         }
                     }
                 }
-                if let Some(w) = widget_weak.upgrade() {
-                    w.queue_draw();
+                widget.queue_draw();
+
+                // If high throughput was received, cooperatively yield to the GTK main loop
+                // to keep UI input, frame rendering, and window responsiveness smooth
+                if had_more || batch.len() >= 32 * 1024 {
+                    glib::timeout_future(std::time::Duration::from_millis(0)).await;
                 }
             }
         });
@@ -339,7 +367,17 @@ impl TerminalView {
         key_controller.set_im_context(Some(&im_context));
         
         let pty_for_im = pty.clone();
+        let term_for_im = terminal.clone();
+        let widget_for_im = widget.downgrade();
         im_context.connect_commit(move |_, text| {
+            if let Ok(mut term) = term_for_im.lock() {
+                if term.display_offset() > 0 {
+                    term.scroll_to_bottom();
+                    if let Some(w) = widget_for_im.upgrade() {
+                        w.queue_draw();
+                    }
+                }
+            }
             if let Ok(pty) = pty_for_im.lock() {
                 let _ = pty.write_all(text.as_bytes());
             }
@@ -395,6 +433,50 @@ impl TerminalView {
                             return glib::Propagation::Stop;
                         }
                         _ => {}
+                    }
+                }
+            }
+
+            // Shift+PageUp, Shift+PageDown, Shift+Home, Shift+End for scrollback navigation
+            if is_shift && !is_ctrl {
+                if let Ok(mut term) = term_for_keys.lock() {
+                    if !term.is_alt_active() {
+                        let page_size = (term.grid().rows.saturating_sub(2)).max(1) as isize;
+                        match keyval {
+                            gdk::Key::Page_Up => {
+                                term.scroll_display(page_size);
+                                drop(term);
+                                if let Some(w) = widget_for_keys.upgrade() {
+                                    w.queue_draw();
+                                }
+                                return glib::Propagation::Stop;
+                            }
+                            gdk::Key::Page_Down => {
+                                term.scroll_display(-page_size);
+                                drop(term);
+                                if let Some(w) = widget_for_keys.upgrade() {
+                                    w.queue_draw();
+                                }
+                                return glib::Propagation::Stop;
+                            }
+                            gdk::Key::Home => {
+                                term.scroll_to_top();
+                                drop(term);
+                                if let Some(w) = widget_for_keys.upgrade() {
+                                    w.queue_draw();
+                                }
+                                return glib::Propagation::Stop;
+                            }
+                            gdk::Key::End => {
+                                term.scroll_to_bottom();
+                                drop(term);
+                                if let Some(w) = widget_for_keys.upgrade() {
+                                    w.queue_draw();
+                                }
+                                return glib::Propagation::Stop;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -456,6 +538,14 @@ impl TerminalView {
             }
 
             if !bytes.is_empty() {
+                if let Ok(mut term) = term_for_keys.lock() {
+                    if term.display_offset() > 0 {
+                        term.scroll_to_bottom();
+                        if let Some(w) = widget_for_keys.upgrade() {
+                            w.queue_draw();
+                        }
+                    }
+                }
                 if let Ok(pty) = pty_for_keys.lock() {
                     let _ = pty.write_all(&bytes);
                 }
@@ -494,6 +584,59 @@ impl TerminalView {
             im_for_leave.focus_out();
         });
         widget.add_controller(focus_controller);
+
+        // Mouse scroll controller for scrollback & alternate screen scrolling
+        let scroll_controller = gtk4::EventControllerScroll::new(
+            gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
+        );
+        let term_for_scroll = terminal.clone();
+        let pty_for_scroll = pty.clone();
+        let widget_for_scroll = widget.downgrade();
+
+        scroll_controller.connect_scroll(move |controller, _dx, dy| {
+            let state = controller.current_event_state();
+            // If Ctrl is held, let it bubble to the window-level opacity/saturation controller
+            if state.contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+
+            let mut term = match term_for_scroll.lock() {
+                Ok(t) => t,
+                Err(_) => return glib::Propagation::Proceed,
+            };
+
+            // If alternate screen is active (vim, less, htop, nano):
+            // Send Up/Down arrow sequences to the child process
+            if term.is_alt_active() {
+                let app = term.state.app_cursor_keys;
+                let code = if dy < 0.0 {
+                    if app { b"\x1bOA" } else { b"\x1b[A" }
+                } else if dy > 0.0 {
+                    if app { b"\x1bOB" } else { b"\x1b[B" }
+                } else {
+                    return glib::Propagation::Stop;
+                };
+
+                if let Ok(pty) = pty_for_scroll.lock() {
+                    for _ in 0..3 {
+                        let _ = pty.write_all(code);
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+
+            // Normal screen: scroll through history (dy < 0 = scroll up / older lines)
+            let lines = if dy < 0.0 { 3 } else { -3 };
+            term.scroll_display(lines);
+            drop(term);
+
+            if let Some(w) = widget_for_scroll.upgrade() {
+                w.queue_draw();
+            }
+
+            glib::Propagation::Stop
+        });
+        widget.add_controller(scroll_controller);
 
         // Mouse Drag selection controller
         let drag_controller = gtk4::GestureDrag::new();

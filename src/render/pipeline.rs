@@ -556,6 +556,7 @@ impl TerminalRenderer {
         grid: &Grid,
         cursor: &crate::term::Cursor,
         cursor_visible: bool,
+        display_offset: usize,
         selection: Option<&SelectionRange>,
         hovered_link: Option<&((usize, usize), (usize, usize))>,
     ) {
@@ -589,7 +590,11 @@ impl TerminalRenderer {
             color: default_bg,
         });
 
-        for (r, row) in grid.lines.iter().enumerate() {
+        for r in 0..grid.rows {
+            let row = match grid.visible_row(r, display_offset) {
+                Some(row) => row,
+                None => continue,
+            };
             let y = r as f32 * cell_h;
             if y >= height as f32 {
                 break;
@@ -676,8 +681,8 @@ impl TerminalRenderer {
             }
         }
 
-        // Draw cursor if visible
-        if cursor_visible && cursor.row < grid.rows && cursor.col < grid.cols {
+        // Draw cursor if visible and looking at live prompt (display_offset == 0)
+        if cursor_visible && display_offset == 0 && cursor.row < grid.rows && cursor.col < grid.cols {
             let cx = cursor.col as f32 * cell_w;
             let cy = cursor.row as f32 * cell_h;
             bg_instances.push(BgInstance {
@@ -849,6 +854,7 @@ mod tests {
             term.grid(),
             &term.state.cursor,
             true,
+            0,
             None,
             None,
         );
@@ -958,7 +964,7 @@ mod tests {
         term.advance("Original Text".as_bytes());
 
         // First render pass
-        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, None, None);
+        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, 0, None, None);
 
         // Update font family and size
         renderer.update_font(&device, &queue, Some("Liberation Mono"), 18.0).unwrap();
@@ -966,7 +972,7 @@ mod tests {
         term.advance("\nUpdated Font Text".as_bytes());
 
         // Second render pass with updated font
-        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, None, None);
+        renderer.render(&device, &queue, &target_view, 400, 300, term.grid(), &term.state.cursor, true, 0, None, None);
 
         assert_eq!(renderer.atlas.font_size, 18.0);
     }

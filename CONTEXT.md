@@ -88,3 +88,36 @@ _Avoid_: Tab title change, header edit
 The creation of a new terminal tab session that inherits the exact working directory of an existing tab.
 _Avoid_: Tab clone, replicate tab
 
+**Display Offset**:
+The vertical offset in rows by which the terminal viewport is shifted upward from the live prompt into the scrollback history buffer.
+_Avoid_: Scroll position, history index
+
+**Scroll-on-Keystroke**:
+The automatic resetting of the display offset to the bottom when input keystrokes are submitted, returning the viewport to the live prompt.
+_Avoid_: Auto-jump, reset view
+
+**Alternate Screen Scroll Pass-Through**:
+The translation of mouse wheel events into directional arrow key sequences when fullscreen applications occupy the alternate screen buffer.
+_Avoid_: Alt-mode scrolling, fake arrow scroll
+
+**Tab State Styling**:
+The distinct visual hierarchy featuring graphite background (`#3c3f41`) and bold white text for the active tab versus black background (`#181818`) with muted gray text for unselected tabs.
+_Avoid_: Active tab tint, tab skin
+
+## Process Concurrency & Performance
+
+Manages asynchronous PTY streaming, GPU buffer lifecycles, and event loop responsiveness under high workloads.
+
+**PTY Backpressure**:
+The throttling mechanism established by bounded channel buffers (128 chunks) preventing memory exhaustion during high-throughput stdout generation.
+_Avoid_: Unbounded queuing, buffer overflow
+
+**Cooperative Yielding**:
+The scheduled yielding of terminal parser execution to the GTK main event loop during burst output, ensuring mouse, keyboard, and compositor frame delivery remain unblocked.
+_Avoid_: Loop monopolization, UI lockup
+
+**DMA-BUF Texture Release**:
+The deterministic closure of exported Linux file descriptors triggered by GTK texture destruction callbacks to prevent per-process file descriptor exhaustion.
+_Avoid_: FD leakage, unmanaged descriptor
+
+

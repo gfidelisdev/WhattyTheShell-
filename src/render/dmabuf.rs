@@ -220,7 +220,18 @@ impl DmabufFrame {
 
         let builder = unsafe { builder.set_fd(0, dup_fd) };
 
-        unsafe { builder.build_with_release_func(release_func) }
+        let res = unsafe {
+            builder.build_with_release_func(move || {
+                libc::close(dup_fd);
+                release_func();
+            })
+        };
+
+        if res.is_err() {
+            unsafe { libc::close(dup_fd); }
+        }
+
+        res
     }
 }
 
@@ -289,21 +300,19 @@ mod tests {
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
 
-        // If running in a graphical session (Wayland/X11), verify GdkTexture builder
+        // If running in a graphical session (Wayland/X11), verify GdkTexture builder and ensure no FD leaks
         if gtk4::init().is_ok() {
             if let Some(display) = gdk::Display::default() {
-                let gdk_texture = frame.build_gdk_texture(&display, || {
-                    println!("Dmabuf frame released by GTK");
-                });
-                match gdk_texture {
-                    Ok(tex) => {
-                        assert_eq!(tex.width(), 128);
-                        assert_eq!(tex.height(), 128);
-                    }
-                    Err(e) => {
-                        println!("Gdk DmabufTextureBuilder note: {e} (normal if running headless or compositor rejects format)");
+                let initial_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+                for _ in 0..500 {
+                    let tex = frame.build_gdk_texture(&display, || {});
+                    if let Ok(t) = tex {
+                        assert_eq!(t.width(), 128);
+                        assert_eq!(t.height(), 128);
                     }
                 }
+                let final_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+                assert!(final_fds < initial_fds + 50, "FD leak detected! {initial_fds} -> {final_fds}");
             }
         }
     }

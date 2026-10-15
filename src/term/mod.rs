@@ -37,6 +37,8 @@ pub struct TermState {
     responses: Vec<u8>,
     /// Set whenever visible state changes; cleared by the renderer.
     pub dirty: bool,
+    /// Number of lines the display viewport is scrolled back into history (0 = bottom / live).
+    pub display_offset: usize,
 }
 
 pub struct Terminal {
@@ -63,6 +65,7 @@ impl Terminal {
                 title: String::new(),
                 responses: Vec::new(),
                 dirty: true,
+                display_offset: 0,
             },
         }
     }
@@ -71,6 +74,48 @@ impl Terminal {
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.state, bytes);
         self.state.dirty = true;
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.state.display_offset
+    }
+
+    pub fn is_alt_active(&self) -> bool {
+        self.state.alt_active
+    }
+
+    /// Scroll display viewport up (positive delta = older history) or down (negative delta).
+    pub fn scroll_display(&mut self, delta: isize) {
+        if self.state.alt_active {
+            return;
+        }
+        let max_offset = self.state.primary.scrollback.len();
+        if delta > 0 {
+            self.state.display_offset = (self.state.display_offset + delta as usize).min(max_offset);
+        } else {
+            let sub = (-delta) as usize;
+            self.state.display_offset = self.state.display_offset.saturating_sub(sub);
+        }
+        self.state.dirty = true;
+    }
+
+    /// Snap view back to the live shell prompt.
+    pub fn scroll_to_bottom(&mut self) {
+        if self.state.display_offset != 0 {
+            self.state.display_offset = 0;
+            self.state.dirty = true;
+        }
+    }
+
+    /// Jump viewport to the very top of scrollback history.
+    pub fn scroll_to_top(&mut self) {
+        if !self.state.alt_active {
+            let max_offset = self.state.primary.scrollback.len();
+            if self.state.display_offset != max_offset {
+                self.state.display_offset = max_offset;
+                self.state.dirty = true;
+            }
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -86,6 +131,7 @@ impl Terminal {
         s.cursor.pending_wrap = false;
         s.scroll_top = 0;
         s.scroll_bottom = rows - 1;
+        s.display_offset = s.display_offset.min(s.primary.scrollback.len());
         s.dirty = true;
     }
 
@@ -98,15 +144,15 @@ impl Terminal {
     }
 
     pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
-        self.state.grid().extract_text(start, end)
+        self.state.grid().extract_text_with_offset(start, end, self.state.display_offset)
     }
 
     pub fn word_at(&self, row: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
-        self.state.grid().word_at(row, col)
+        self.state.grid().word_at_with_offset(row, col, self.state.display_offset)
     }
 
     pub fn url_at(&self, row: usize, col: usize) -> Option<(String, ((usize, usize), (usize, usize)))> {
-        self.state.grid().url_at(row, col)
+        self.state.grid().url_at_with_offset(row, col, self.state.display_offset)
     }
 }
 
@@ -564,5 +610,65 @@ mod tests {
         // Outside URL (col 2 is inside "visit")
         let none_url = t.url_at(0, 2);
         assert!(none_url.is_none());
+    }
+
+    #[test]
+    fn test_high_throughput_terminal_burst() {
+        let mut t = Terminal::new(80, 24);
+        let line = b"Testing heavy output line with some ANSI codes: \x1b[32mOK\x1b[0m\r\n";
+        let mut chunk = Vec::with_capacity(line.len() * 100);
+        for _ in 0..100 {
+            chunk.extend_from_slice(line);
+        }
+        for _ in 0..100 {
+            t.advance(&chunk);
+        }
+        assert_eq!(t.grid().rows, 24);
+        assert_eq!(t.grid().cols, 80);
+        assert!(t.grid().scrollback.len() <= 10_000);
+    }
+
+    #[test]
+    fn test_terminal_scrollback_and_text_extraction() {
+        let mut t = Terminal::new(20, 3);
+        // Print 5 lines: line 0, 1, 2, 3, 4
+        t.advance(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4");
+        // Lines on live screen (display_offset 0): line 2, line 3, line 4
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 2");
+        assert_eq!(t.extract_text((1, 0), (1, 5)), "line 3");
+        assert_eq!(t.extract_text((2, 0), (2, 5)), "line 4");
+        assert_eq!(t.display_offset(), 0);
+
+        // Scroll up 1 line: live viewport shows line 1, line 2, line 3
+        t.scroll_display(1);
+        assert_eq!(t.display_offset(), 1);
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 1");
+        assert_eq!(t.extract_text((1, 0), (1, 5)), "line 2");
+        assert_eq!(t.extract_text((2, 0), (2, 5)), "line 3");
+
+        // Scroll up another line (top of history): line 0, line 1, line 2
+        t.scroll_display(1);
+        assert_eq!(t.display_offset(), 2);
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 0");
+        assert_eq!(t.extract_text((1, 0), (1, 5)), "line 1");
+
+        // Trying to scroll past max scrollback clamps to max (2)
+        t.scroll_display(10);
+        assert_eq!(t.display_offset(), 2);
+
+        // Scroll down 1 line
+        t.scroll_display(-1);
+        assert_eq!(t.display_offset(), 1);
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 1");
+
+        // Scroll to bottom
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0);
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 2");
+
+        // Scroll to top
+        t.scroll_to_top();
+        assert_eq!(t.display_offset(), 2);
+        assert_eq!(t.extract_text((0, 0), (0, 5)), "line 0");
     }
 }

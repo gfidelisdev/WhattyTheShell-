@@ -149,6 +149,28 @@ impl Grid {
         self.rows = rows;
     }
 
+    /// Returns the row at visible position `r` (0..self.rows) taking `display_offset` into account.
+    /// `display_offset == 0` corresponds to the active/live screen lines.
+    /// `display_offset > 0` scrolls into the scrollback history.
+    pub fn visible_row(&self, r: usize, display_offset: usize) -> Option<&Row> {
+        if r >= self.rows {
+            return None;
+        }
+        let dist_from_bottom = (self.rows - 1 - r).checked_add(display_offset)?;
+        if dist_from_bottom < self.rows {
+            let line_idx = self.rows - 1 - dist_from_bottom;
+            self.lines.get(line_idx)
+        } else {
+            let offset_into_scrollback = dist_from_bottom - self.rows + 1;
+            if offset_into_scrollback <= self.scrollback.len() {
+                let sb_idx = self.scrollback.len() - offset_into_scrollback;
+                self.scrollback.get(sb_idx)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Plain-text dump of the visible screen (for tests / debugging).
     #[allow(dead_code)]
     pub fn text(&self) -> String {
@@ -159,8 +181,18 @@ impl Grid {
             .join("\n")
     }
 
-    /// Extract text from the given selection span (inclusive of start and end cells).
+    /// Extract text from the given selection span on the live screen (offset 0).
     pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        self.extract_text_with_offset(start, end, 0)
+    }
+
+    /// Extract text from the given selection span taking `display_offset` into account.
+    pub fn extract_text_with_offset(
+        &self,
+        start: (usize, usize),
+        end: (usize, usize),
+        display_offset: usize,
+    ) -> String {
         let (s, e) = if start <= end { (start, end) } else { (end, start) };
         if self.lines.is_empty() || self.cols == 0 || s.0 >= self.rows {
             return String::new();
@@ -170,7 +202,10 @@ impl Grid {
         let mut result = Vec::new();
 
         for r in s.0..=e_row {
-            let row = &self.lines[r];
+            let row = match self.visible_row(r, display_offset) {
+                Some(row) => row,
+                None => continue,
+            };
             let col_start = if r == s.0 { s.1.min(self.cols - 1) } else { 0 };
             let col_end = if r == e_row { e.1.min(self.cols - 1) } else { self.cols - 1 };
 
@@ -179,11 +214,7 @@ impl Grid {
                     .iter()
                     .map(|c| if c.c == '\0' { ' ' } else { c.c })
                     .collect();
-                if r == e_row {
-                    result.push(line_str.trim_end().to_string());
-                } else {
-                    result.push(line_str.trim_end().to_string());
-                }
+                result.push(line_str.trim_end().to_string());
             } else {
                 result.push(String::new());
             }
@@ -192,13 +223,23 @@ impl Grid {
         result.join("\n")
     }
 
-    /// Find word boundaries around the given cell (for double-click word selection).
+    /// Find word boundaries around the given cell (for double-click word selection) on live screen.
     pub fn word_at(&self, row: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
+        self.word_at_with_offset(row, col, 0)
+    }
+
+    /// Find word boundaries around the given cell taking `display_offset` into account.
+    pub fn word_at_with_offset(
+        &self,
+        row: usize,
+        col: usize,
+        display_offset: usize,
+    ) -> Option<((usize, usize), (usize, usize))> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
 
-        let cells = &self.lines[row];
+        let cells = self.visible_row(row, display_offset)?;
         let target_char = cells[col].c;
         if target_char == ' ' || target_char == '\0' {
             return None;
@@ -233,13 +274,24 @@ impl Grid {
         Some(((row, start_col), (row, end_col)))
     }
 
-    /// Find an HTTP/HTTPS URL at the specified cell (for Ctrl + click hyperlink activation).
+    /// Find an HTTP/HTTPS URL at the specified cell (for Ctrl + click hyperlink activation) on live screen.
     pub fn url_at(&self, row: usize, col: usize) -> Option<(String, ((usize, usize), (usize, usize)))> {
+        self.url_at_with_offset(row, col, 0)
+    }
+
+    /// Find an HTTP/HTTPS URL at the specified cell taking `display_offset` into account.
+    pub fn url_at_with_offset(
+        &self,
+        row: usize,
+        col: usize,
+        display_offset: usize,
+    ) -> Option<(String, ((usize, usize), (usize, usize)))> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
 
-        let line_chars: Vec<char> = self.lines[row]
+        let cells = self.visible_row(row, display_offset)?;
+        let line_chars: Vec<char> = cells
             .iter()
             .map(|c| if c.c == '\0' { ' ' } else { c.c })
             .collect();

@@ -88,9 +88,71 @@ fn main() {
         }
         theme_manager.apply_to_window(&window);
 
-        // Styling for tab context menus and rename popovers
+        // Styling for tab context menus, rename popovers, and tab headers
         let popover_css_provider = gtk4::CssProvider::new();
         popover_css_provider.load_from_string("
+            /* Notebook and Tab Bar Styling */
+            notebook > header {
+                background-color: #121212;
+                border: none;
+                padding: 2px 4px;
+            }
+            notebook > header.top {
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            }
+            notebook > header.left {
+                border-right: 1px solid rgba(255, 255, 255, 0.08);
+            }
+            notebook > header tabs tab {
+                background-color: #181818;
+                color: #9e9e9e;
+                font-weight: normal;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 6px;
+                margin: 2px 3px;
+                padding: 4px 10px;
+                transition: background-color 0.15s ease, color 0.15s ease;
+            }
+            notebook > header tabs tab:hover {
+                background-color: #252525;
+                color: #d0d0d0;
+                border-color: rgba(255, 255, 255, 0.15);
+            }
+            notebook > header tabs tab:checked {
+                background-color: #3c3f41;
+                color: #ffffff;
+                font-weight: bold;
+                border: 1px solid rgba(255, 255, 255, 0.28);
+                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+            }
+            notebook > header tabs tab:checked:hover {
+                background-color: #45484c;
+                color: #ffffff;
+            }
+            notebook > header tabs tab label {
+                color: inherit;
+                font-weight: inherit;
+            }
+            notebook > header tabs tab .tab-close-btn {
+                opacity: 0.5;
+                background: transparent;
+                border: none;
+                padding: 2px 4px;
+                min-width: 16px;
+                min-height: 16px;
+                border-radius: 4px;
+                margin-left: 6px;
+            }
+            notebook > header tabs tab:checked .tab-close-btn {
+                opacity: 0.9;
+                color: #ffffff;
+            }
+            notebook > header tabs tab .tab-close-btn:hover {
+                opacity: 1.0;
+                background-color: rgba(255, 255, 255, 0.2);
+                color: #ffffff;
+            }
+
             .tab-context-popover {
                 background-color: #2b2d30;
                 color: #ffffff;
@@ -253,6 +315,21 @@ fn main() {
 
                         let label = gtk4::Label::new(Some(&tab_title));
                         tab_box.append(&label);
+
+                        let tab_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+                        tab_close_btn.add_css_class("flat");
+                        tab_close_btn.add_css_class("tab-close-btn");
+                        tab_close_btn.set_valign(gtk4::Align::Center);
+                        tab_close_btn.set_can_focus(false);
+                        tab_close_btn.set_tooltip_text(Some("Fechar Aba"));
+                        let nb_for_cb = notebook.clone();
+                        let win_for_cb = window.clone();
+                        let cfg_for_cb = cfg_for_tab.clone();
+                        let view_for_cb = view.clone();
+                        tab_close_btn.connect_clicked(move |_| {
+                            close_tab_page(&nb_for_cb, &win_for_cb, &cfg_for_cb, &view_for_cb);
+                        });
+                        tab_box.append(&tab_close_btn);
 
                         // Dedicated popover for tab renaming
                         let rename_popover = gtk4::Popover::new();
