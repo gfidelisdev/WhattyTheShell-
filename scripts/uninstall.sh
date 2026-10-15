@@ -30,7 +30,7 @@ rm -f "$DATADIR/metainfo/io.github.whattytheshell.metainfo.xml"
 
 # 3. Remove icons
 for size in 16 24 32 48 64 128 256 512; do
-  rm -f "$ICONDIR/${size}x${size}/apps/io.github.whattytheshell.png"
+  rm -f "$ICONDIR/${size}x${size}/apps/io.github.whattytheshell*.png"
 done
 
 # 4. Remove uninstaller and metadata directory

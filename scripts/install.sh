@@ -63,20 +63,22 @@ chmod 644 "$APPDIR/io.github.whattytheshell.desktop"
 
 # 5. Install Icons
 for size in 16 24 32 48 64 128 256 512; do
-  SRC_ICON=""
-  if [ -f "$SCRIPT_DIR/share/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png" ]; then
-    SRC_ICON="$SCRIPT_DIR/share/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png"
-  elif [ -f "$SCRIPT_DIR/assets/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png" ]; then
-    SRC_ICON="$SCRIPT_DIR/assets/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png"
-  elif [ -f "$SCRIPT_DIR/../assets/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png" ]; then
-    SRC_ICON="$SCRIPT_DIR/../assets/icons/hicolor/${size}x${size}/apps/io.github.whattytheshell.png"
-  fi
+  for icon_name in io.github.whattytheshell.png io.github.whattytheshell-classic.png; do
+    SRC_ICON=""
+    if [ -f "$SCRIPT_DIR/share/icons/hicolor/${size}x${size}/apps/$icon_name" ]; then
+      SRC_ICON="$SCRIPT_DIR/share/icons/hicolor/${size}x${size}/apps/$icon_name"
+    elif [ -f "$SCRIPT_DIR/assets/icons/hicolor/${size}x${size}/apps/$icon_name" ]; then
+      SRC_ICON="$SCRIPT_DIR/assets/icons/hicolor/${size}x${size}/apps/$icon_name"
+    elif [ -f "$SCRIPT_DIR/../assets/icons/hicolor/${size}x${size}/apps/$icon_name" ]; then
+      SRC_ICON="$SCRIPT_DIR/../assets/icons/hicolor/${size}x${size}/apps/$icon_name"
+    fi
 
-  if [ -n "$SRC_ICON" ]; then
-    mkdir -p "$ICONDIR/${size}x${size}/apps"
-    cp "$SRC_ICON" "$ICONDIR/${size}x${size}/apps/io.github.whattytheshell.png"
-    chmod 644 "$ICONDIR/${size}x${size}/apps/io.github.whattytheshell.png"
-  fi
+    if [ -n "$SRC_ICON" ]; then
+      mkdir -p "$ICONDIR/${size}x${size}/apps"
+      cp "$SRC_ICON" "$ICONDIR/${size}x${size}/apps/$icon_name"
+      chmod 644 "$ICONDIR/${size}x${size}/apps/$icon_name"
+    fi
+  done
 done
 
 # 6. Install AppStream metadata

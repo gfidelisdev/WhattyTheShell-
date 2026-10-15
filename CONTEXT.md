@@ -32,6 +32,14 @@ _Avoid_: Default theme, local preset
 A theme palette retrieved dynamically from an external extension registry.
 _Avoid_: Remote theme, online extension
 
+**Active Theme Indicator**:
+The visual banner, badge (`✓ Active`), and row highlight within the settings dialog identifying the currently active theme palette and swatches.
+_Avoid_: Current theme marker, theme tag
+
+**Application Icon Variant**:
+The selected desktop and window branding icon variant ("modern" for the new official logo or "classic" for the retro neon turtle icon).
+_Avoid_: App logo switch, window picture
+
 ## Packaging & Distribution
 
 Manages build artifacts, distribution packages, system menu integration, and release workflows.

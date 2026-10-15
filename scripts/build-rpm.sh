@@ -77,7 +77,7 @@ chmod 644 %{buildroot}/usr/share/metainfo/io.github.whattytheshell.metainfo.xml
 /usr/bin/wts
 /usr/bin/WhattyTheShell
 /usr/share/applications/io.github.whattytheshell.desktop
-/usr/share/icons/hicolor/*/apps/io.github.whattytheshell.png
+/usr/share/icons/hicolor/*/apps/io.github.whattytheshell*.png
 /usr/share/metainfo/io.github.whattytheshell.metainfo.xml
 
 %post

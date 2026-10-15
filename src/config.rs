@@ -86,6 +86,10 @@ pub struct Config {
     /// Double-click tab header closes tab.
     #[serde(default = "default_true")]
     pub double_click_close_tab: bool,
+
+    /// Selected application icon variant ("modern" or "classic").
+    #[serde(default = "default_app_icon")]
+    pub app_icon: String,
 }
 
 fn default_orientation() -> TabOrientation {
@@ -112,6 +116,20 @@ fn default_saturation() -> f32 {
     1.0
 }
 
+fn default_app_icon() -> String {
+    "modern".to_string()
+}
+
+impl Config {
+    pub fn app_icon_name(&self) -> &'static str {
+        if self.app_icon.eq_ignore_ascii_case("classic") {
+            "io.github.whattytheshell-classic"
+        } else {
+            "io.github.whattytheshell"
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -129,6 +147,7 @@ impl Default for Config {
             experimental_supersaturation: default_false(),
             color_saturation: default_saturation(),
             double_click_close_tab: default_true(),
+            app_icon: default_app_icon(),
         }
     }
 }
@@ -277,6 +296,15 @@ impl ConfigManager {
         self.config.double_click_close_tab = val;
         let _ = self.save();
     }
+
+    pub fn app_icon(&self) -> String {
+        self.config.app_icon.clone()
+    }
+
+    pub fn set_app_icon(&mut self, icon: String) {
+        self.config.app_icon = icon;
+        let _ = self.save();
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +320,7 @@ mod tests {
         });
         cfg.font_family = Some("Fira Code".into());
         cfg.font_size = 16.0;
+        cfg.app_icon = "classic".into();
 
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -299,6 +328,8 @@ mod tests {
         assert_eq!(parsed.open_tabs[0].working_dir, Some(PathBuf::from("/home/user/project")));
         assert_eq!(parsed.font_family, Some("Fira Code".into()));
         assert_eq!(parsed.font_size, 16.0);
+        assert_eq!(parsed.app_icon, "classic");
+        assert_eq!(parsed.app_icon_name(), "io.github.whattytheshell-classic");
     }
 
     #[test]
@@ -309,6 +340,8 @@ mod tests {
         assert!(!cfg.experimental_supersaturation);
         assert_eq!(cfg.color_saturation, 1.0);
         assert!(cfg.double_click_close_tab);
+        assert_eq!(cfg.app_icon, "modern");
+        assert_eq!(cfg.app_icon_name(), "io.github.whattytheshell");
 
         cfg.active_tab_index = Some(2);
         cfg.window_opacity = 0.85;
@@ -316,6 +349,7 @@ mod tests {
         cfg.experimental_supersaturation = true;
         cfg.color_saturation = 1.35;
         cfg.double_click_close_tab = false;
+        cfg.app_icon = "classic".into();
 
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -326,5 +360,6 @@ mod tests {
         assert!(parsed.experimental_supersaturation);
         assert_eq!(parsed.color_saturation, 1.35);
         assert!(!parsed.double_click_close_tab);
+        assert_eq!(parsed.app_icon, "classic");
     }
 }

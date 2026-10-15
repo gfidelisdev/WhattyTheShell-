@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Align, ApplicationWindow, Box as GtkBox, Button, DrawingArea,
-    Entry, Frame, GestureClick, Label, ListBox, ListBoxRow, Notebook, Orientation,
+    glib, Align, ApplicationWindow, Box as GtkBox, Button, CheckButton, DrawingArea,
+    Entry, Frame, GestureClick, Image, Label, ListBox, ListBoxRow, Notebook, Orientation,
     ProgressBar, Scale, ScrolledWindow, SearchEntry, SpinButton, Stack, StackSwitcher,
     Switch, Window,
 };
@@ -189,6 +189,62 @@ fn create_terminal_mockup(colors: &HashMap<String, String>) -> GtkBox {
     outer_box
 }
 
+fn load_icon_preview(icon_name: &str, file_rel_path: &str) -> Image {
+    if std::path::Path::new(file_rel_path).exists() {
+        let img = Image::from_file(file_rel_path);
+        img.set_pixel_size(48);
+        img
+    } else {
+        let img = Image::from_icon_name(icon_name);
+        img.set_pixel_size(48);
+        img
+    }
+}
+
+fn update_user_desktop_icon(icon_name: &str) {
+    if let Some(data_dir) = dirs_next::data_dir() {
+        let desktop_path = data_dir.join("applications/io.github.whattytheshell.desktop");
+        if desktop_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&desktop_path) {
+                let updated = content
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with("Icon=") {
+                            format!("Icon={}", icon_name)
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n") + "\n";
+                let _ = std::fs::write(&desktop_path, updated);
+                let _ = std::process::Command::new("update-desktop-database")
+                    .arg(data_dir.join("applications"))
+                    .output();
+            }
+        }
+    }
+}
+
+fn get_active_theme_display(config_manager: &crate::config::ConfigManager) -> (String, Vec<String>) {
+    let name = config_manager
+        .theme_name()
+        .unwrap_or_else(|| "Default Dark".to_string());
+    let swatches = if let Some(colors) = config_manager.theme_colors() {
+        extract_key_swatches(&colors)
+    } else {
+        vec![
+            "#121212".into(),
+            "#e0e0e0".into(),
+            "#ff5555".into(),
+            "#50fa7b".into(),
+            "#61afef".into(),
+            "#bd93f9".into(),
+        ]
+    };
+    (name, swatches)
+}
+
 pub fn open_settings_dialog(
     parent: &ApplicationWindow,
     notebook: &Notebook,
@@ -218,10 +274,106 @@ pub fn open_settings_dialog(
     root_box.append(&switcher);
 
     // ==========================================
-    // TAB 1: Appearance (Font & Custom Colors)
+    // TAB 1: Appearance (Font, Custom Colors & App Icon)
     // ==========================================
     let appearance_box = GtkBox::new(Orientation::Vertical, 16);
     appearance_box.set_margin_top(12);
+
+    // Section 0: Application Icon
+    let icon_section = GtkBox::new(Orientation::Vertical, 8);
+    let icon_title = Label::new(Some("Application Icon"));
+    icon_title.set_halign(Align::Start);
+    icon_title.add_css_class("heading");
+    icon_section.append(&icon_title);
+
+    let icon_desc = Label::new(Some("Choose the icon style for WhattyTheShell (window and desktop):"));
+    icon_desc.set_halign(Align::Start);
+    icon_desc.add_css_class("dim-label");
+    icon_section.append(&icon_desc);
+
+    let icon_cards_box = GtkBox::new(Orientation::Horizontal, 16);
+
+    let is_classic = config_manager.borrow().app_icon() == "classic";
+
+    // Modern Option Card (Default)
+    let modern_card = GtkBox::new(Orientation::Horizontal, 12);
+    modern_card.add_css_class("icon-choice-card");
+    let modern_img = load_icon_preview("io.github.whattytheshell", "icons/wts.png");
+    let modern_info = GtkBox::new(Orientation::Vertical, 2);
+    let modern_radio = CheckButton::builder()
+        .label("Modern (Default)")
+        .active(!is_classic)
+        .build();
+    let modern_sub = Label::new(Some("New official application icon"));
+    modern_sub.set_halign(Align::Start);
+    modern_sub.add_css_class("dim-label");
+    modern_info.append(&modern_radio);
+    modern_info.append(&modern_sub);
+    modern_card.append(&modern_img);
+    modern_card.append(&modern_info);
+
+    // Classic Option Card (Original)
+    let classic_card = GtkBox::new(Orientation::Horizontal, 12);
+    classic_card.add_css_class("icon-choice-card");
+    let classic_img = load_icon_preview("io.github.whattytheshell-classic", "icons/wts-old.png");
+    let classic_info = GtkBox::new(Orientation::Vertical, 2);
+    let classic_radio = CheckButton::builder()
+        .label("Classic (Original)")
+        .group(&modern_radio)
+        .active(is_classic)
+        .build();
+    let classic_sub = Label::new(Some("Retro neon terminal icon"));
+    classic_sub.set_halign(Align::Start);
+    classic_sub.add_css_class("dim-label");
+    classic_info.append(&classic_radio);
+    classic_info.append(&classic_sub);
+    classic_card.append(&classic_img);
+    classic_card.append(&classic_info);
+
+    // Connect toggles
+    let parent_for_modern = parent.clone();
+    let cfg_for_modern = config_manager.clone();
+    modern_radio.connect_toggled(move |btn| {
+        if btn.is_active() {
+            cfg_for_modern.borrow_mut().set_app_icon("modern".into());
+            let icon_name = "io.github.whattytheshell";
+            parent_for_modern.set_icon_name(Some(icon_name));
+            gtk4::Window::set_default_icon_name(icon_name);
+            update_user_desktop_icon(icon_name);
+        }
+    });
+
+    let parent_for_classic = parent.clone();
+    let cfg_for_classic = config_manager.clone();
+    classic_radio.connect_toggled(move |btn| {
+        if btn.is_active() {
+            cfg_for_classic.borrow_mut().set_app_icon("classic".into());
+            let icon_name = "io.github.whattytheshell-classic";
+            parent_for_classic.set_icon_name(Some(icon_name));
+            gtk4::Window::set_default_icon_name(icon_name);
+            update_user_desktop_icon(icon_name);
+        }
+    });
+
+    let m_radio_clone = modern_radio.clone();
+    let click_modern = GestureClick::new();
+    click_modern.connect_pressed(move |_, _, _, _| {
+        m_radio_clone.set_active(true);
+    });
+    modern_card.add_controller(click_modern);
+
+    let c_radio_clone = classic_radio.clone();
+    let click_classic = GestureClick::new();
+    click_classic.connect_pressed(move |_, _, _, _| {
+        c_radio_clone.set_active(true);
+    });
+    classic_card.add_controller(click_classic);
+
+    icon_cards_box.append(&modern_card);
+    icon_cards_box.append(&classic_card);
+    icon_section.append(&icon_cards_box);
+
+    appearance_box.append(&icon_section);
 
     // Font Section
     let font_section = GtkBox::new(Orientation::Vertical, 8);
@@ -411,10 +563,17 @@ pub fn open_settings_dialog(
 
     // Colors Section
     let color_section = GtkBox::new(Orientation::Vertical, 8);
+    let color_title_box = GtkBox::new(Orientation::Horizontal, 8);
     let color_title = Label::new(Some("Custom Colors"));
     color_title.set_halign(Align::Start);
     color_title.add_css_class("heading");
-    color_section.append(&color_title);
+    color_title_box.append(&color_title);
+
+    let (active_theme_str, _) = get_active_theme_display(&config_manager.borrow());
+    let active_theme_chip = Label::new(Some(&format!("Active: {}", active_theme_str)));
+    active_theme_chip.add_css_class("theme-active-badge");
+    color_title_box.append(&active_theme_chip);
+    color_section.append(&color_title_box);
 
     let colors_row = GtkBox::new(Orientation::Horizontal, 12);
 
@@ -488,13 +647,42 @@ pub fn open_settings_dialog(
     });
 
     appearance_box.append(&color_section);
-    stack.add_titled(&appearance_box, Some("appearance"), "Appearance");
+    let appearance_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&appearance_box)
+        .build();
+    stack.add_titled(&appearance_scroll, Some("appearance"), "Appearance");
 
     // ==========================================
     // TAB 2: Marketplace Themes (2-Column Layout)
     // ==========================================
     let marketplace_box = GtkBox::new(Orientation::Vertical, 10);
     marketplace_box.set_margin_top(12);
+
+    // Active Theme Indicator Banner
+    let active_theme_bar = GtkBox::new(Orientation::Horizontal, 10);
+    active_theme_bar.add_css_class("active-theme-bar");
+
+    let active_theme_icon = Image::from_icon_name("preferences-desktop-theme-symbolic");
+    let active_theme_title = Label::new(Some("Active Theme:"));
+    active_theme_title.add_css_class("heading");
+
+    let (active_name, active_swatches) = get_active_theme_display(&config_manager.borrow());
+    let active_badge = Label::new(Some(&active_name));
+    active_badge.add_css_class("theme-active-badge");
+
+    let active_sw_box = GtkBox::new(Orientation::Horizontal, 0);
+    let active_sw = create_swatches_widget(&active_swatches, 90, 18);
+    active_sw_box.append(&active_sw);
+
+    active_theme_bar.append(&active_theme_icon);
+    active_theme_bar.append(&active_theme_title);
+    active_theme_bar.append(&active_badge);
+    active_theme_bar.append(&active_sw_box);
+
+    marketplace_box.append(&active_theme_bar);
 
     let search_entry = SearchEntry::new();
     search_entry.set_placeholder_text(Some("Search themes (e.g. Dracula, One Dark, Nord, Gruvbox)..."));
@@ -603,15 +791,30 @@ pub fn open_settings_dialog(
         let p_apply = apply_theme_btn.clone();
         let cur_colors = current_preview_colors.clone();
         let cur_name = current_preview_name.clone();
+        let cfg_prev = config_manager.clone();
 
         move |name: &str, author: &str, colors: &HashMap<String, String>| {
             p_title.set_text(name);
-            p_author.set_text(&format!("by {}", author));
 
-            // Store in state and ENABLE the Apply button!
+            let active_name = cfg_prev
+                .borrow()
+                .theme_name()
+                .unwrap_or_else(|| "Default Dark".into());
+            let is_active = name.eq_ignore_ascii_case(&active_name);
+
+            if is_active {
+                p_author.set_text(&format!("by {} • ✓ Current Active Theme", author));
+                p_apply.set_label("✓ Current Theme");
+                p_apply.set_sensitive(false);
+            } else {
+                p_author.set_text(&format!("by {}", author));
+                p_apply.set_label("Apply Theme");
+                p_apply.set_sensitive(true);
+            }
+
+            // Store in state
             *cur_colors.lock().unwrap() = Some(colors.clone());
             *cur_name.lock().unwrap() = Some(name.to_string());
-            p_apply.set_sensitive(true);
 
             // Update Swatches
             while let Some(child) = p_swatches.first_child() {
@@ -633,14 +836,25 @@ pub fn open_settings_dialog(
     let populate_popular_list = {
         let tlb = theme_list_box.clone();
         let update_prev = update_preview_panel.clone();
+        let cfg_pop = config_manager.clone();
 
         move || {
             tlb.remove_all();
+            let active_name = cfg_pop
+                .borrow()
+                .theme_name()
+                .unwrap_or_else(|| "Default Dark".into());
+
             for (name, publisher, colors) in popular_presets() {
                 let row = ListBoxRow::new();
                 row.set_cursor_from_name(Some("pointer"));
                 row.set_activatable(true);
                 row.set_selectable(true);
+
+                let is_active = name.eq_ignore_ascii_case(&active_name);
+                if is_active {
+                    row.add_css_class("active-theme-row");
+                }
 
                 let row_box = GtkBox::new(Orientation::Horizontal, 10);
                 row_box.set_margin_top(6);
@@ -651,15 +865,23 @@ pub fn open_settings_dialog(
                 let info_box = GtkBox::new(Orientation::Vertical, 2);
                 info_box.set_hexpand(true);
 
+                let title_box = GtkBox::new(Orientation::Horizontal, 8);
                 let title = Label::new(Some(name));
                 title.set_halign(Align::Start);
                 title.add_css_class("heading");
+                title_box.append(&title);
+
+                if is_active {
+                    let badge = Label::new(Some("✓ Active"));
+                    badge.add_css_class("theme-active-badge");
+                    title_box.append(&badge);
+                }
 
                 let author = Label::new(Some(&format!("by {}", publisher)));
                 author.set_halign(Align::Start);
                 author.add_css_class("dim-label");
 
-                info_box.append(&title);
+                info_box.append(&title_box);
                 info_box.append(&author);
                 row_box.append(&info_box);
 
@@ -688,8 +910,17 @@ pub fn open_settings_dialog(
     // Populate initial popular presets
     populate_popular_list();
 
-    // Pre-select and preview Dracula immediately on open
-    if let Some((first_name, first_pub, first_colors)) = popular_presets().into_iter().next() {
+    // Pre-select and preview the current active theme on open
+    let (initial_active_name, _) = get_active_theme_display(&config_manager.borrow());
+    let found_preset = popular_presets().into_iter().find(|(name, _, _)| {
+        name.eq_ignore_ascii_case(&initial_active_name)
+    });
+
+    if let Some((name, pub_name, colors)) = found_preset {
+        update_preview_panel(name, pub_name, &colors);
+    } else if let Some(colors) = config_manager.borrow().theme_colors() {
+        update_preview_panel(&initial_active_name, "Current Config", &colors);
+    } else if let Some((first_name, first_pub, first_colors)) = popular_presets().into_iter().next() {
         update_preview_panel(first_name, first_pub, &first_colors);
     }
 
@@ -732,6 +963,7 @@ pub fn open_settings_dialog(
     let progress_bar_clone = progress_bar.clone();
     let update_preview_cl = update_preview_panel.clone();
     let pop_popular = populate_popular_list.clone();
+    let cfg_search = config_manager.clone();
 
     search_entry.connect_search_changed(move |entry| {
         let text = entry.text().to_string();
@@ -753,6 +985,7 @@ pub fn open_settings_dialog(
             let status_cl = status_label_clone.clone();
             let pbar_cl = progress_bar_clone.clone();
             let up_cl = update_preview_cl.clone();
+            let cfg_search_inner = cfg_search.clone();
 
             let (tx, rx): (async_channel::Sender<Vec<Extension>>, _) =
                 async_channel::unbounded();
@@ -778,6 +1011,18 @@ pub fn open_settings_dialog(
                         row.set_activatable(true);
                         row.set_selectable(true);
 
+                        let is_active = {
+                            let act = cfg_search_inner
+                                .borrow()
+                                .theme_name()
+                                .unwrap_or_else(|| "Default Dark".into());
+                            ext_name.eq_ignore_ascii_case(&act)
+                        };
+
+                        if is_active {
+                            row.add_css_class("active-theme-row");
+                        }
+
                         let row_box = GtkBox::new(Orientation::Horizontal, 10);
                         row_box.set_margin_top(6);
                         row_box.set_margin_bottom(6);
@@ -786,15 +1031,24 @@ pub fn open_settings_dialog(
 
                         let info_box = GtkBox::new(Orientation::Vertical, 2);
                         info_box.set_hexpand(true);
+
+                        let title_box = GtkBox::new(Orientation::Horizontal, 8);
                         let title = Label::new(Some(&ext_name));
                         title.set_halign(Align::Start);
                         title.add_css_class("heading");
+                        title_box.append(&title);
+
+                        if is_active {
+                            let badge = Label::new(Some("✓ Active"));
+                            badge.add_css_class("theme-active-badge");
+                            title_box.append(&badge);
+                        }
 
                         let author = Label::new(Some(&format!("by {}", pub_name)));
                         author.set_halign(Align::Start);
                         author.add_css_class("dim-label");
 
-                        info_box.append(&title);
+                        info_box.append(&title_box);
                         info_box.append(&author);
                         row_box.append(&info_box);
 

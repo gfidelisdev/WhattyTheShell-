@@ -49,9 +49,25 @@ fn main() {
     app.connect_activate(move |app| {
         let config_manager = config_manager.clone();
         let mut theme_manager = theme_manager.clone();
+
+        // Register local icon search paths if running from source tree or unpacked directory
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let icon_theme = gtk4::IconTheme::for_display(&display);
+            if std::path::Path::new("assets/icons").exists() {
+                icon_theme.add_search_path("assets/icons");
+            }
+            if std::path::Path::new("assets/icons/hicolor").exists() {
+                icon_theme.add_search_path("assets/icons/hicolor");
+            }
+        }
+
+        let initial_icon_name = config_manager.borrow().config.app_icon_name();
+        gtk4::Window::set_default_icon_name(initial_icon_name);
+
         let window = ApplicationWindow::builder()
             .application(app)
             .title("WhattyTheShell! – GPU Terminal")
+            .icon_name(initial_icon_name)
             .default_width(1024)
             .default_height(768)
             .build();
@@ -199,6 +215,35 @@ fn main() {
             }
             .tab-context-popover entry:focus {
                 border-color: #3574d4;
+            }
+            .icon-choice-card {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 10px 14px;
+                transition: background-color 0.15s ease, border-color 0.15s ease;
+            }
+            .icon-choice-card:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-color: rgba(255, 255, 255, 0.25);
+            }
+            .active-theme-bar {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+                padding: 8px 14px;
+            }
+            .theme-active-badge {
+                background-color: #3574d4;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 2px 8px;
+                border-radius: 10px;
+            }
+            .active-theme-row {
+                background-color: rgba(53, 116, 212, 0.08);
+                border-left: 3px solid #3574d4;
             }
         ");
         if let Some(display) = gtk4::gdk::Display::default() {
