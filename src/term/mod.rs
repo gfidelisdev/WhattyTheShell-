@@ -610,6 +610,22 @@ mod tests {
         // Outside URL (col 2 is inside "visit")
         let none_url = t.url_at(0, 2);
         assert!(none_url.is_none());
+
+        // Test with multi-byte unicode prefix (e.g. starship prompt "❯ ")
+        let mut t2 = Terminal::new(90, 2);
+        t2.advance("❯ git: https://github.com/gfidelis/WhattyTheShell and http://example.org".as_bytes());
+        let url_unicode = t2.url_at(0, 15);
+        assert!(url_unicode.is_some());
+        let (extracted, span) = url_unicode.unwrap();
+        assert_eq!(extracted, "https://github.com/gfidelis/WhattyTheShell");
+        assert_eq!(span, ((0, 7), (0, 48)));
+
+        // Second URL on same line
+        let url_second = t2.url_at(0, 56);
+        assert!(url_second.is_some());
+        let (extracted2, span2) = url_second.unwrap();
+        assert_eq!(extracted2, "http://example.org");
+        assert_eq!(span2, ((0, 54), (0, 71)));
     }
 
     #[test]

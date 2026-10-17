@@ -522,7 +522,48 @@ fn main() {
                         });
                         menu_box.append(&dup_btn);
 
-                        // 3. Copiar Caminho do Diretório
+                        // 3. Mover Aba para Esquerda / Cima
+                        let is_vert = matches!(notebook.tab_pos(), gtk4::PositionType::Left | gtk4::PositionType::Right);
+                        let move_prev_btn = create_menu_item(
+                            if is_vert { "Mover Aba para Cima" } else { "Mover Aba para a Esquerda" },
+                            if is_vert { "go-up-symbolic" } else { "go-previous-symbolic" },
+                        );
+                        let pop_move_prev = popover.clone();
+                        let nb_for_move_prev = notebook.clone();
+                        let view_for_move_prev = view.clone();
+                        move_prev_btn.connect_clicked(move |_| {
+                            pop_move_prev.popdown();
+                            if let Some(idx) = nb_for_move_prev.page_num(&view_for_move_prev) {
+                                if idx > 0 {
+                                    nb_for_move_prev.reorder_child(&view_for_move_prev, Some(idx - 1));
+                                    nb_for_move_prev.set_current_page(Some(idx - 1));
+                                    view_for_move_prev.grab_focus();
+                                }
+                            }
+                        });
+                        menu_box.append(&move_prev_btn);
+
+                        // 4. Mover Aba para Direita / Baixo
+                        let move_next_btn = create_menu_item(
+                            if is_vert { "Mover Aba para Baixo" } else { "Mover Aba para a Direita" },
+                            if is_vert { "go-down-symbolic" } else { "go-next-symbolic" },
+                        );
+                        let pop_move_next = popover.clone();
+                        let nb_for_move_next = notebook.clone();
+                        let view_for_move_next = view.clone();
+                        move_next_btn.connect_clicked(move |_| {
+                            pop_move_next.popdown();
+                            if let Some(idx) = nb_for_move_next.page_num(&view_for_move_next) {
+                                if idx + 1 < nb_for_move_next.n_pages() {
+                                    nb_for_move_next.reorder_child(&view_for_move_next, Some(idx + 1));
+                                    nb_for_move_next.set_current_page(Some(idx + 1));
+                                    view_for_move_next.grab_focus();
+                                }
+                            }
+                        });
+                        menu_box.append(&move_next_btn);
+
+                        // 5. Copiar Caminho do Diretório
                         let copy_path_btn = create_menu_item("Copiar Caminho do Diretório", "edit-copy-symbolic");
                         let pop_copy = popover.clone();
                         let view_for_copy = view.clone();
@@ -541,7 +582,7 @@ fn main() {
                         // Separador
                         menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-                        // 4. Fechar Aba
+                        // 6. Fechar Aba
                         let close_btn = create_menu_item("Fechar Aba", "window-close-symbolic");
                         let pop_close = popover.clone();
                         let nb_for_close_btn = notebook.clone();
@@ -559,7 +600,7 @@ fn main() {
                         });
                         menu_box.append(&close_btn);
 
-                        // 5. Fechar Outras Abas
+                        // 7. Fechar Outras Abas
                         let close_others_btn = create_menu_item("Fechar Outras Abas", "edit-clear-symbolic");
                         let pop_close_others = popover.clone();
                         let nb_for_close_others = notebook.clone();
@@ -593,8 +634,16 @@ fn main() {
                         let tab_right_click = gtk4::GestureClick::new();
                         tab_right_click.set_button(gtk4::gdk::BUTTON_SECONDARY);
                         let pop_trigger = popover.clone();
+                        let nb_for_right_click = notebook.clone();
+                        let view_for_right_click = view.clone();
+                        let btn_p = move_prev_btn.clone();
+                        let btn_n = move_next_btn.clone();
                         tab_right_click.connect_pressed(move |gesture, _, _, _| {
                             gesture.set_state(gtk4::EventSequenceState::Claimed);
+                            if let Some(idx) = nb_for_right_click.page_num(&view_for_right_click) {
+                                btn_p.set_sensitive(idx > 0);
+                                btn_n.set_sensitive(idx + 1 < nb_for_right_click.n_pages());
+                            }
                             pop_trigger.popup();
                         });
                         tab_box.add_controller(tab_right_click);
@@ -636,6 +685,7 @@ fn main() {
                         tab_box.add_controller(tab_left_click);
 
                         let idx = notebook.append_page(&view, Some(&tab_box));
+                        notebook.set_tab_reorderable(&view, true);
                         notebook.set_current_page(Some(idx));
 
                         // Immediately focus terminal view and cursor
@@ -700,6 +750,72 @@ fn main() {
         });
         window.add_action(&new_tab_action);
         app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>t", "<Ctrl><Shift>Tab"]);
+
+        // Reorganize tabs actions and shortcuts
+        let nb_move_l = tab_group.widget().clone();
+        let move_tab_left_action = gtk4::gio::SimpleAction::new("move-tab-left", None);
+        move_tab_left_action.connect_activate(move |_, _| {
+            if let Some(cur) = nb_move_l.current_page() {
+                if cur > 0 {
+                    if let Some(page) = nb_move_l.nth_page(Some(cur)) {
+                        nb_move_l.reorder_child(&page, Some(cur - 1));
+                        nb_move_l.set_current_page(Some(cur - 1));
+                        page.grab_focus();
+                    }
+                }
+            }
+        });
+        window.add_action(&move_tab_left_action);
+        app.set_accels_for_action("win.move-tab-left", &["<Ctrl><Shift>Page_Up", "<Ctrl><Shift>Prior"]);
+
+        let nb_move_r = tab_group.widget().clone();
+        let move_tab_right_action = gtk4::gio::SimpleAction::new("move-tab-right", None);
+        move_tab_right_action.connect_activate(move |_, _| {
+            if let Some(cur) = nb_move_r.current_page() {
+                if cur + 1 < nb_move_r.n_pages() {
+                    if let Some(page) = nb_move_r.nth_page(Some(cur)) {
+                        nb_move_r.reorder_child(&page, Some(cur + 1));
+                        nb_move_r.set_current_page(Some(cur + 1));
+                        page.grab_focus();
+                    }
+                }
+            }
+        });
+        window.add_action(&move_tab_right_action);
+        app.set_accels_for_action("win.move-tab-right", &["<Ctrl><Shift>Page_Down", "<Ctrl><Shift>Next"]);
+
+        // Switch tab actions and shortcuts
+        let nb_prev_t = tab_group.widget().clone();
+        let prev_tab_action = gtk4::gio::SimpleAction::new("prev-tab", None);
+        prev_tab_action.connect_activate(move |_, _| {
+            let n = nb_prev_t.n_pages();
+            if n > 1 {
+                let cur = nb_prev_t.current_page().unwrap_or(0);
+                let prev = if cur == 0 { n - 1 } else { cur - 1 };
+                nb_prev_t.set_current_page(Some(prev));
+                if let Some(page) = nb_prev_t.nth_page(Some(prev)) {
+                    page.grab_focus();
+                }
+            }
+        });
+        window.add_action(&prev_tab_action);
+        app.set_accels_for_action("win.prev-tab", &["<Ctrl>Page_Up", "<Ctrl>Prior"]);
+
+        let nb_next_t = tab_group.widget().clone();
+        let next_tab_action = gtk4::gio::SimpleAction::new("next-tab", None);
+        next_tab_action.connect_activate(move |_, _| {
+            let n = nb_next_t.n_pages();
+            if n > 1 {
+                let cur = nb_next_t.current_page().unwrap_or(0);
+                let next = (cur + 1) % n;
+                nb_next_t.set_current_page(Some(next));
+                if let Some(page) = nb_next_t.nth_page(Some(next)) {
+                    page.grab_focus();
+                }
+            }
+        });
+        window.add_action(&next_tab_action);
+        app.set_accels_for_action("win.next-tab", &["<Ctrl>Page_Down", "<Ctrl>Next"]);
 
         // Preferences / Settings Action
         let preferences_action = gtk4::gio::SimpleAction::new("preferences", None);

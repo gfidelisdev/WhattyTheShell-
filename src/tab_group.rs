@@ -19,6 +19,7 @@ impl TabGroup {
         notebook.set_hexpand(true);
         notebook.set_vexpand(true);
         notebook.set_scrollable(true);
+        notebook.set_group_name(Some("whatty-terminal-tabs"));
 
         let pos = match orientation {
             TabOrientation::Horizontal => PositionType::Top,
@@ -36,7 +37,9 @@ impl TabGroup {
     #[allow(dead_code)]
     pub fn add_tab(&self, view: &TerminalView, title: &str) -> u32 {
         let label = Label::new(Some(title));
-        self.notebook.append_page(view, Some(&label))
+        let idx = self.notebook.append_page(view, Some(&label));
+        self.notebook.set_tab_reorderable(view, true);
+        idx
     }
 
     /// Return the underlying widget for insertion into the UI hierarchy.

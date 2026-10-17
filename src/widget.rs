@@ -421,7 +421,7 @@ impl TerminalView {
                     }
                 }
 
-                // Ctrl+Shift+C (Copy) and Ctrl+Shift+V (Paste)
+                // Ctrl+Shift shortcuts (Copy, Paste, Move Tab Left/Right)
                 if is_ctrl && is_shift {
                     match keyval {
                         gdk::Key::C | gdk::Key::c => {
@@ -431,6 +431,33 @@ impl TerminalView {
                         gdk::Key::V | gdk::Key::v => {
                             w.paste_clipboard();
                             return glib::Propagation::Stop;
+                        }
+                        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
+                            if w.activate_action("win.move-tab-left", None).is_ok() {
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
+                            if w.activate_action("win.move-tab-right", None).is_ok() {
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Ctrl shortcuts (Previous/Next Tab)
+                if is_ctrl && !is_shift {
+                    match keyval {
+                        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
+                            if w.activate_action("win.prev-tab", None).is_ok() {
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
+                            if w.activate_action("win.next-tab", None).is_ok() {
+                                return glib::Propagation::Stop;
+                            }
                         }
                         _ => {}
                     }
@@ -704,18 +731,18 @@ impl TerminalView {
 
                 if button == gdk::BUTTON_PRIMARY {
                     if let Some(inner) = w.imp().inner.borrow().as_ref() {
-                        let is_ctrl = *inner.ctrl_pressed.borrow();
+                        let is_ctrl = *inner.ctrl_pressed.borrow()
+                            || gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
                         if is_ctrl && n_press == 1 {
-                            if let Some((row, col)) = w.pixel_to_cell(x, y) {
-                                if let Ok(term) = inner.terminal.lock() {
-                                    if let Some((url, _)) = term.url_at(row, col) {
-                                        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
-                                            &url,
-                                            None::<&gtk4::gio::AppLaunchContext>,
-                                        );
-                                        return;
-                                    }
-                                }
+                            let clicked_url = if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                                inner.terminal.lock().ok().and_then(|term| term.url_at(row, col).map(|(u, _)| u))
+                            } else {
+                                None
+                            };
+                            let target_url = clicked_url.or_else(|| inner.hovered_url.borrow().clone());
+                            if let Some(url) = target_url {
+                                w.open_url(&url);
+                                return;
                             }
                         }
 
@@ -765,10 +792,12 @@ impl TerminalView {
         // Motion controller for hover link detection
         let motion_controller = gtk4::EventControllerMotion::new();
         let motion_w = widget.downgrade();
+        let motion_ctrl = motion_controller.clone();
         motion_controller.connect_motion(move |_, x, y| {
             if let Some(w) = motion_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
-                    let is_ctrl = *inner.ctrl_pressed.borrow();
+                    let is_ctrl = *inner.ctrl_pressed.borrow()
+                        || motion_ctrl.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
                     if is_ctrl {
                         if let Some((row, col)) = w.pixel_to_cell(x, y) {
                             if let Ok(term) = inner.terminal.lock() {
@@ -961,6 +990,40 @@ impl TerminalView {
             inner.renderer.borrow_mut().set_saturation_boost(boost);
             self.queue_draw();
         }
+    }
+
+    pub fn open_url(&self, url: &str) {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+
+        // 1. Try GtkUriLauncher (GTK 4.10+) with parent window
+        let launcher = gtk4::UriLauncher::new(&url);
+        let root = self.root();
+        let window = root.as_ref().and_then(|r| r.downcast_ref::<gtk4::Window>());
+
+        let url_clone = url.clone();
+        launcher.launch(window, None::<&gtk4::gio::Cancellable>, move |res| {
+            if let Err(err) = res {
+                eprintln!("[Whatty] UriLauncher failed ({}), attempting Gio launch...", err);
+                let display = gdk::Display::default();
+                let context = display.as_ref().map(|d| d.app_launch_context());
+                let gio_res = gtk4::gio::AppInfo::launch_default_for_uri(
+                    &url_clone,
+                    context.as_ref(),
+                );
+                if let Err(gio_err) = gio_res {
+                    eprintln!("[Whatty] Gio launch failed ({}), falling back to xdg-open...", gio_err);
+                    if let Err(cmd_err) = std::process::Command::new("xdg-open")
+                        .arg(&url_clone)
+                        .spawn()
+                    {
+                        eprintln!("[Whatty] Failed to open URL via xdg-open: {}", cmd_err);
+                    }
+                }
+            }
+        });
     }
 }
 

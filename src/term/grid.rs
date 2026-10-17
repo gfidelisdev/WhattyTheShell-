@@ -295,39 +295,47 @@ impl Grid {
             .iter()
             .map(|c| if c.c == '\0' { ' ' } else { c.c })
             .collect();
-        let line_str: String = line_chars.iter().collect();
+        let https_prefix = ['h', 't', 't', 'p', 's', ':', '/', '/'];
+        let http_prefix = ['h', 't', 't', 'p', ':', '/', '/'];
 
-        for prefix in ["https://", "http://"] {
-            let mut search_idx = 0;
-            while let Some(start_pos) = line_str[search_idx..].find(prefix) {
-                let actual_start = search_idx + start_pos;
-                let mut actual_end = actual_start;
+        let mut i = 0;
+        while i < line_chars.len() {
+            let prefix_len = if line_chars[i..].starts_with(&https_prefix) {
+                https_prefix.len()
+            } else if line_chars[i..].starts_with(&http_prefix) {
+                http_prefix.len()
+            } else {
+                i += 1;
+                continue;
+            };
 
-                while actual_end < line_str.len() {
-                    let ch = line_chars[actual_end];
-                    if ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == '(' || ch == ')' || ch == '[' || ch == ']' {
-                        break;
-                    }
-                    actual_end += 1;
+            let start_col = i;
+            let mut end_col = start_col + prefix_len;
+
+            while end_col < line_chars.len() {
+                let ch = line_chars[end_col];
+                if ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == '(' || ch == ')' || ch == '[' || ch == ']' {
+                    break;
                 }
-
-                // Trim trailing punctuation like '.', ',', ';', ':'
-                while actual_end > actual_start {
-                    let last_ch = line_chars[actual_end - 1];
-                    if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == ':' {
-                        actual_end -= 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if col >= actual_start && col < actual_end {
-                    let url: String = line_chars[actual_start..actual_end].iter().collect();
-                    return Some((url, ((row, actual_start), (row, actual_end - 1))));
-                }
-
-                search_idx = actual_start + prefix.len();
+                end_col += 1;
             }
+
+            // Trim trailing punctuation like '.', ',', ';', ':'
+            while end_col > start_col {
+                let last_ch = line_chars[end_col - 1];
+                if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == ':' {
+                    end_col -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            if col >= start_col && col < end_col {
+                let url: String = line_chars[start_col..end_col].iter().collect();
+                return Some((url, ((row, start_col), (row, end_col - 1))));
+            }
+
+            i = end_col.max(start_col + 1);
         }
 
         None
