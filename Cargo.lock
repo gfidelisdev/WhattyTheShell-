@@ -20,6 +20,7 @@ dependencies = [
  "serde_json",
  "swash",
  "toml 0.8.23",
+ "unicode-width",
  "vte",
  "wgpu",
  "zip",

@@ -29,6 +29,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 async-channel = "2.3"
 pollster = "0.4"
 zip = "8.6.0"
+unicode-width = "0.2.2"
 
 [features]
 default = ["vulkan"]

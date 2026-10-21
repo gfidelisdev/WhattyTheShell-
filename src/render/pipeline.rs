@@ -661,7 +661,7 @@ impl TerminalRenderer {
                 }
 
                 // Glyph
-                if cell.c != ' ' && cell.c != '\0' {
+                if cell.c != ' ' && cell.c != '\0' && (cell.flags & flags::WIDE_SPACER) == 0 {
                     let mut cell_flags = cell.flags;
                     if is_link {
                         cell_flags |= flags::UNDERLINE;

@@ -26,6 +26,8 @@ pub struct SavedTab {
     pub title: Option<String>,
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub custom_title: bool,
 }
 
 /// Top‑level configuration structure.
@@ -317,6 +319,7 @@ mod tests {
         cfg.open_tabs.push(SavedTab {
             title: Some("Terminal 1".into()),
             working_dir: Some(PathBuf::from("/home/user/project")),
+            custom_title: true,
         });
         cfg.font_family = Some("Fira Code".into());
         cfg.font_size = 16.0;
@@ -326,6 +329,7 @@ mod tests {
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.open_tabs.len(), 1);
         assert_eq!(parsed.open_tabs[0].working_dir, Some(PathBuf::from("/home/user/project")));
+        assert!(parsed.open_tabs[0].custom_title);
         assert_eq!(parsed.font_family, Some("Fira Code".into()));
         assert_eq!(parsed.font_size, 16.0);
         assert_eq!(parsed.app_icon, "classic");

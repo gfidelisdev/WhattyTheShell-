@@ -301,7 +301,12 @@ mod tests {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
 
         // If running in a graphical session (Wayland/X11), verify GdkTexture builder and ensure no FD leaks
-        if gtk4::init().is_ok() {
+        let can_run_gtk = if gtk4::is_initialized() {
+            gtk4::is_initialized_main_thread()
+        } else {
+            gtk4::init().is_ok()
+        };
+        if can_run_gtk {
             if let Some(display) = gdk::Display::default() {
                 let initial_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
                 for _ in 0..500 {

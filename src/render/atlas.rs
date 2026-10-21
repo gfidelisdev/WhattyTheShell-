@@ -285,8 +285,11 @@ impl GlyphAtlas {
                 }
 
                 if self.cursor_y + h + 1 >= ATLAS_SIZE {
-                    // Atlas full: fallback (or in future: clear / resize)
-                    return GlyphInfo::default();
+                    // Atlas full: evict cached glyph placements and restart allocation from the top
+                    self.cache.clear();
+                    self.cursor_x = 1;
+                    self.cursor_y = 1;
+                    self.row_height = 0;
                 }
 
                 let x = self.cursor_x;

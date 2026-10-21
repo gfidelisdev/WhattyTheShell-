@@ -39,6 +39,10 @@ pub struct TermState {
     pub dirty: bool,
     /// Number of lines the display viewport is scrolled back into history (0 = bottom / live).
     pub display_offset: usize,
+    /// Stack of active Kitty Keyboard Protocol flags (progressive enhancement).
+    pub kitty_keyboard_stack: Vec<u8>,
+    /// Last printed character, used by REP (CSI b).
+    last_char: Option<char>,
 }
 
 pub struct Terminal {
@@ -66,6 +70,8 @@ impl Terminal {
                 responses: Vec::new(),
                 dirty: true,
                 display_offset: 0,
+                kitty_keyboard_stack: Vec::new(),
+                last_char: None,
             },
         }
     }
@@ -143,6 +149,10 @@ impl Terminal {
         std::mem::take(&mut self.state.responses)
     }
 
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.state.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
     pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
         self.state.grid().extract_text_with_offset(start, end, self.state.display_offset)
     }
@@ -186,6 +196,7 @@ impl TermState {
         } else if self.cursor.row < self.rows() - 1 {
             self.cursor.row += 1;
         }
+        self.cursor.pending_wrap = false;
     }
 
     fn reverse_index(&mut self) {
@@ -201,6 +212,7 @@ impl TermState {
         if on == self.alt_active {
             return;
         }
+        self.display_offset = 0;
         if on {
             self.saved_cursor = Some(self.cursor);
             self.alt_active = true;
@@ -300,17 +312,51 @@ fn parse_ext_color(sub: &[u16]) -> Option<Color> {
 
 impl TermState {
     fn print_char(&mut self, c: char) {
-        if self.cursor.pending_wrap && self.autowrap {
-            self.cursor.col = 0;
-            self.linefeed();
-            self.cursor.pending_wrap = false;
+        use unicode_width::UnicodeWidthChar;
+        self.last_char = Some(c);
+        let width = c.width().unwrap_or(1);
+        if width == 0 {
+            // Zero-width / combining character
+            return;
         }
-        let (row, col, pen) = (self.cursor.row, self.cursor.col, self.cursor.pen);
-        self.grid_mut().lines[row][col] = Cell { c, ..pen };
-        if col + 1 >= self.cols() {
-            self.cursor.pending_wrap = true;
+
+        if width >= 2 {
+            if self.cursor.pending_wrap && self.autowrap {
+                self.cursor.col = 0;
+                self.linefeed();
+            }
+            if self.cursor.col + 1 >= self.cols() && self.autowrap {
+                self.cursor.col = 0;
+                self.linefeed();
+            }
+
+            let (row, col, pen) = (self.cursor.row, self.cursor.col, self.cursor.pen);
+            self.grid_mut().lines[row][col] = Cell { c, ..pen };
+            if col + 1 < self.cols() {
+                self.grid_mut().lines[row][col + 1] = Cell {
+                    c: ' ',
+                    flags: pen.flags | flags::WIDE_SPACER,
+                    ..pen
+                };
+            }
+            if col + 2 >= self.cols() {
+                self.cursor.col = self.cols() - 1;
+                self.cursor.pending_wrap = true;
+            } else {
+                self.cursor.col += 2;
+            }
         } else {
-            self.cursor.col += 1;
+            if self.cursor.pending_wrap && self.autowrap {
+                self.cursor.col = 0;
+                self.linefeed();
+            }
+            let (row, col, pen) = (self.cursor.row, self.cursor.col, self.cursor.pen);
+            self.grid_mut().lines[row][col] = Cell { c, ..pen };
+            if col + 1 >= self.cols() {
+                self.cursor.pending_wrap = true;
+            } else {
+                self.cursor.col += 1;
+            }
         }
     }
 }
@@ -334,6 +380,7 @@ impl Perform for TermState {
             b'\t' => {
                 let next = (self.cursor.col / 8 + 1) * 8;
                 self.cursor.col = next.min(self.cols() - 1);
+                self.cursor.pending_wrap = false;
             }
             _ => {} // BEL etc. ignored for now
         }
@@ -357,10 +404,29 @@ impl Perform for TermState {
             ('D', false) => self.goto(row, col.saturating_sub(arg(0, 1))),
             ('E', false) => self.goto(row + arg(0, 1), 0),
             ('F', false) => self.goto(row.saturating_sub(arg(0, 1)), 0),
+            ('I', false) => {
+                // CHT: cursor forward tabulation
+                let mut c = col;
+                for _ in 0..arg(0, 1) { c = (c / 8 + 1) * 8; }
+                self.goto(row, c);
+            }
+            ('Z', false) => {
+                // CBT: cursor backward tabulation
+                let mut c = col;
+                for _ in 0..arg(0, 1) { c = if c == 0 { 0 } else { (c - 1) / 8 * 8 }; }
+                self.goto(row, c);
+            }
+            ('b', false) => {
+                // REP: repeat the preceding graphic character
+                if let Some(ch) = self.last_char {
+                    for _ in 0..arg(0, 1).min(65535) { self.print_char(ch); }
+                }
+            }
             ('G', false) | ('`', false) => self.goto(row, arg(0, 1) - 1),
             ('d', false) => self.goto(arg(0, 1) - 1, col),
             ('H', false) | ('f', false) => self.goto(arg(0, 1) - 1, arg(1, 1) - 1),
-            ('J', _) => {
+            ('J', _) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
                 let g = self.grid_mut();
                 match ps.first().copied().unwrap_or(0) {
                     0 => {
@@ -376,7 +442,8 @@ impl Perform for TermState {
                     _ => {}
                 }
             }
-            ('K', _) => {
+            ('K', _) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
                 let g = self.grid_mut();
                 match ps.first().copied().unwrap_or(0) {
                     0 => g.clear_range(row, col, cols, &pen),
@@ -385,7 +452,8 @@ impl Perform for TermState {
                     _ => {}
                 }
             }
-            ('L', false) | ('M', false) => {
+            ('L', false) | ('M', false) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
                 if row >= self.scroll_top && row <= self.scroll_bottom {
                     let bottom = self.scroll_bottom;
                     let n = arg(0, 1);
@@ -394,22 +462,26 @@ impl Perform for TermState {
                     } else {
                         self.grid_mut().scroll_up_no_history(row, bottom, n, &pen);
                     }
-                    self.cursor.col = 0;
                 }
             }
-            ('P', false) => {
+            ('P', false) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
                 let n = arg(0, 1).min(cols - col);
                 let line = &mut self.grid_mut().lines[row];
                 line.drain(col..col + n);
                 line.extend(std::iter::repeat(Cell::blank(&pen)).take(n));
             }
-            ('@', false) => {
+            ('@', false) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
                 let n = arg(0, 1).min(cols - col);
                 let line = &mut self.grid_mut().lines[row];
                 for _ in 0..n { line.insert(col, Cell::blank(&pen)) }
                 line.truncate(cols);
             }
-            ('X', false) => self.grid_mut().clear_range(row, col, col + arg(0, 1), &pen),
+            ('X', false) if intermediates.is_empty() => {
+                self.cursor.pending_wrap = false;
+                self.grid_mut().clear_range(row, col, col + arg(0, 1), &pen);
+            }
             ('S', false) => {
                 let (t, b) = (self.scroll_top, self.scroll_bottom);
                 self.grid_mut().scroll_up(t, b, arg(0, 1), &pen);
@@ -418,7 +490,7 @@ impl Perform for TermState {
                 let (t, b) = (self.scroll_top, self.scroll_bottom);
                 self.grid_mut().scroll_down(t, b, arg(0, 1), &pen);
             }
-            ('m', false) => self.sgr(params),
+            ('m', false) if intermediates.is_empty() => self.sgr(params),
             ('r', false) => {
                 let top = arg(0, 1) - 1;
                 let bottom = arg(1, rows).min(rows) - 1;
@@ -430,7 +502,59 @@ impl Perform for TermState {
             }
             ('s', false) => self.saved_cursor = Some(self.cursor),
             ('u', false) => {
-                if let Some(c) = self.saved_cursor { self.cursor = c }
+                match intermediates.first() {
+                    Some(&b'>') => {
+                        let flags = arg(0, 0) as u8;
+                        self.kitty_keyboard_stack.push(flags);
+                    }
+                    Some(&b'<') => {
+                        let count = arg(0, 1).max(1);
+                        for _ in 0..count {
+                            self.kitty_keyboard_stack.pop();
+                        }
+                    }
+                    Some(&b'=') => {
+                        let flags = arg(0, 0) as u8;
+                        let mode = arg(1, 1);
+                        match mode {
+                            1 => {
+                                if self.kitty_keyboard_stack.is_empty() {
+                                    self.kitty_keyboard_stack.push(flags);
+                                } else {
+                                    let idx = self.kitty_keyboard_stack.len() - 1;
+                                    self.kitty_keyboard_stack[idx] = flags;
+                                }
+                            }
+                            2 => {
+                                if let Some(top) = self.kitty_keyboard_stack.last_mut() {
+                                    *top |= flags;
+                                } else {
+                                    self.kitty_keyboard_stack.push(flags);
+                                }
+                            }
+                            3 => {
+                                if let Some(top) = self.kitty_keyboard_stack.last_mut() {
+                                    *top &= !flags;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        if let Some(c) = self.saved_cursor {
+                            self.cursor.row = c.row.min(self.rows().saturating_sub(1));
+                            self.cursor.col = c.col.min(self.cols().saturating_sub(1));
+                            self.cursor.pen = c.pen;
+                            self.cursor.pending_wrap = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ('u', true) => {
+                // CSI ? u -> Query Kitty Keyboard Protocol
+                let flags = self.kitty_keyboard_stack.last().copied().unwrap_or(0);
+                self.responses.extend(format!("\x1b[?{}u", flags).bytes());
             }
             ('h', p) | ('l', p) => {
                 for &m in &ps { self.set_mode(p, m, action == 'h') }
@@ -440,7 +564,15 @@ impl Perform for TermState {
                 6 => self.responses.extend(format!("\x1b[{};{}R", row + 1, col + 1).bytes()),
                 _ => {}
             },
-            ('c', false) => self.responses.extend_from_slice(b"\x1b[?62;22c"),
+            ('c', false) => {
+                if intermediates.first() == Some(&b'>') {
+                    // Secondary Device Attributes (DA2): VT100 / xterm compatible version
+                    self.responses.extend_from_slice(b"\x1b[>0;10;1c");
+                } else if intermediates.is_empty() {
+                    // Primary Device Attributes (DA1): VT102 compatible
+                    self.responses.extend_from_slice(b"\x1b[?62;22c");
+                }
+            }
             _ => {}
         }
     }
@@ -452,7 +584,12 @@ impl Perform for TermState {
         match byte {
             b'7' => self.saved_cursor = Some(self.cursor),
             b'8' => {
-                if let Some(c) = self.saved_cursor { self.cursor = c }
+                if let Some(c) = self.saved_cursor {
+                    self.cursor.row = c.row.min(self.rows().saturating_sub(1));
+                    self.cursor.col = c.col.min(self.cols().saturating_sub(1));
+                    self.cursor.pen = c.pen;
+                    self.cursor.pending_wrap = false;
+                }
             }
             b'D' => self.linefeed(),
             b'E' => {
@@ -515,6 +652,42 @@ mod tests {
         assert_eq!(t.grid().text(), "ab\n\n");
         t.advance(b"\x1b[2J\x1b[2;2HX");
         assert_eq!(t.grid().text(), "\n X\n");
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol() {
+        let mut t = Terminal::new(10, 2);
+        // Query initial flags
+        t.advance(b"\x1b[?u");
+        assert_eq!(t.take_responses(), b"\x1b[?0u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+
+        // Push flag 1 (disambiguate escape codes)
+        t.advance(b"\x1b[>1u");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+
+        // Query again
+        t.advance(b"\x1b[?u");
+        assert_eq!(t.take_responses(), b"\x1b[?1u");
+
+        // Push flag 3
+        t.advance(b"\x1b[>3u");
+        assert_eq!(t.kitty_keyboard_flags(), 3);
+
+        // Pop
+        t.advance(b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+
+        t.advance(b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+
+        // ANSI restore cursor with empty intermediates still works
+        t.advance(b"\x1b[1;2H\x1b[s\x1b[2;5H");
+        assert_eq!(t.state.cursor.row, 1);
+        assert_eq!(t.state.cursor.col, 4);
+        t.advance(b"\x1b[u");
+        assert_eq!(t.state.cursor.row, 0);
+        assert_eq!(t.state.cursor.col, 1);
     }
 
     #[test]
@@ -626,6 +799,41 @@ mod tests {
         let (extracted2, span2) = url_second.unwrap();
         assert_eq!(extracted2, "http://example.org");
         assert_eq!(span2, ((0, 54), (0, 71)));
+
+        // Standalone file:// URL
+        let mut t3 = Terminal::new(100, 2);
+        t3.advance(b"File created at file:///home/gfidelis/Code/test.txt#L10-L20 ready");
+        let file_url = t3.url_at(0, 20);
+        assert!(file_url.is_some());
+        let (extracted3, span3) = file_url.unwrap();
+        assert_eq!(extracted3, "file:///home/gfidelis/Code/test.txt#L10-L20");
+        assert_eq!(span3, ((0, 16), (0, 58)));
+
+        // Markdown link with file:// URL [Review Plan](file:///tmp/plan.md)
+        let mut t4 = Terminal::new(100, 2);
+        t4.advance(b"Please review [Review Plan](file:///tmp/plan.md) before continuing");
+        // Clicking inside label "Review Plan"
+        let md_label_click = t4.url_at(0, 20);
+        assert!(md_label_click.is_some());
+        let (extracted4, span4) = md_label_click.unwrap();
+        assert_eq!(extracted4, "file:///tmp/plan.md");
+        assert_eq!(span4, ((0, 14), (0, 47)));
+
+        // Clicking inside URL part
+        let md_url_click = t4.url_at(0, 35);
+        assert!(md_url_click.is_some());
+        let (extracted5, span5) = md_url_click.unwrap();
+        assert_eq!(extracted5, "file:///tmp/plan.md");
+        assert_eq!(span5, ((0, 14), (0, 47)));
+
+        // Markdown link with code formatting: [`src/widget.rs`](file:///path/to/src/widget.rs#L42)
+        let mut t5 = Terminal::new(100, 2);
+        t5.advance(b"Updated [`src/widget.rs`](file:///path/to/src/widget.rs#L42) with changes");
+        let code_click = t5.url_at(0, 12);
+        assert!(code_click.is_some());
+        let (extracted6, span6) = code_click.unwrap();
+        assert_eq!(extracted6, "file:///path/to/src/widget.rs#L42");
+        assert_eq!(span6, ((0, 8), (0, 59)));
     }
 
     #[test]
@@ -686,5 +894,88 @@ mod tests {
         t.scroll_to_top();
         assert_eq!(t.display_offset(), 2);
         assert_eq!(t.extract_text((0, 0), (0, 5)), "line 0");
+    }
+
+    #[test]
+    fn test_wide_characters_and_spacers() {
+        let mut t = Terminal::new(10, 2);
+        // "🚀" has width 2, "a" has width 1
+        t.advance("🚀a".as_bytes());
+        assert_eq!(t.grid().lines[0][0].c, '🚀');
+        assert_eq!(t.grid().lines[0][1].flags & flags::WIDE_SPACER, flags::WIDE_SPACER);
+        assert_eq!(t.grid().lines[0][2].c, 'a');
+        assert_eq!(t.state.cursor.col, 3);
+        // Text extraction should not contain the phantom spacer
+        assert_eq!(t.extract_text((0, 0), (0, 3)), "🚀a");
+    }
+
+    #[test]
+    fn test_insert_delete_line_preserves_cursor_col() {
+        let mut t = Terminal::new(10, 4);
+        t.advance(b"\x1b[2;5H"); // row 1, col 4
+        assert_eq!(t.state.cursor.row, 1);
+        assert_eq!(t.state.cursor.col, 4);
+
+        // IL (Insert Line)
+        t.advance(b"\x1b[L");
+        assert_eq!(t.state.cursor.row, 1);
+        assert_eq!(t.state.cursor.col, 4);
+
+        // DL (Delete Line)
+        t.advance(b"\x1b[M");
+        assert_eq!(t.state.cursor.row, 1);
+        assert_eq!(t.state.cursor.col, 4);
+    }
+
+    #[test]
+    fn test_modify_other_keys_does_not_corrupt_sgr() {
+        let mut t = Terminal::new(20, 2);
+        // Vim sends CSI > 4 ; 2 m on entering insert mode or pressing delete
+        t.advance(b"\x1b[>4;2mTest");
+        // Ensure character 'T' does NOT have UNDERLINE or DIM flags set!
+        assert_eq!(t.grid().lines[0][0].c, 'T');
+        assert_eq!(t.grid().lines[0][0].flags & flags::UNDERLINE, 0);
+        assert_eq!(t.grid().lines[0][0].flags & flags::DIM, 0);
+    }
+
+    #[test]
+    fn test_secondary_device_attributes_query() {
+        let mut t = Terminal::new(20, 2);
+        t.advance(b"\x1b[>c");
+        assert_eq!(t.take_responses(), b"\x1b[>0;10;1c");
+
+        // Primary DA query
+        t.advance(b"\x1b[c");
+        assert_eq!(t.take_responses(), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn test_alt_screen_resets_display_offset() {
+        let mut t = Terminal::new(20, 3);
+        t.advance(b"line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5");
+        t.scroll_display(2);
+        assert_eq!(t.display_offset(), 2);
+
+        // Enter alt screen (like nano/vim opening)
+        t.advance(b"\x1b[?1049h");
+        assert_eq!(t.display_offset(), 0);
+
+        // Leave alt screen
+        t.advance(b"\x1b[?1049l");
+        assert_eq!(t.display_offset(), 0);
+    }
+
+    #[test]
+    fn test_cbt_cht_rep() {
+        let mut t = Terminal::new(40, 2);
+        t.advance(b"\x1b[1;20H\x1b[Z");
+        assert_eq!(t.state.cursor.col, 16);
+        t.advance(b"\x1b[2Z");
+        assert_eq!(t.state.cursor.col, 0);
+        t.advance(b"\x1b[I");
+        assert_eq!(t.state.cursor.col, 8);
+        t.advance(b"\x1b[1;1Ha\x1b[3b");
+        assert_eq!(t.grid().lines[0][3].c, 'a');
+        assert_eq!(t.state.cursor.col, 4);
     }
 }

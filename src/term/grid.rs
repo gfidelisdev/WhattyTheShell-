@@ -22,6 +22,7 @@ pub mod flags {
     pub const INVERSE: u8 = 1 << 4;
     pub const HIDDEN: u8 = 1 << 5;
     pub const STRIKE: u8 = 1 << 6;
+    pub const WIDE_SPACER: u8 = 1 << 7;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +213,7 @@ impl Grid {
             if col_start <= col_end {
                 let line_str: String = row[col_start..=col_end]
                     .iter()
+                    .filter(|c| (c.flags & flags::WIDE_SPACER) == 0)
                     .map(|c| if c.c == '\0' { ' ' } else { c.c })
                     .collect();
                 result.push(line_str.trim_end().to_string());
@@ -240,7 +242,12 @@ impl Grid {
         }
 
         let cells = self.visible_row(row, display_offset)?;
-        let target_char = cells[col].c;
+        let actual_col = if col > 0 && (cells[col].flags & flags::WIDE_SPACER) != 0 {
+            col - 1
+        } else {
+            col
+        };
+        let target_char = cells[actual_col].c;
         if target_char == ' ' || target_char == '\0' {
             return None;
         }
@@ -274,12 +281,12 @@ impl Grid {
         Some(((row, start_col), (row, end_col)))
     }
 
-    /// Find an HTTP/HTTPS URL at the specified cell (for Ctrl + click hyperlink activation) on live screen.
+    /// Find a URL or hyperlink (HTTP/HTTPS/file or markdown link) at the specified cell (for Ctrl + click hyperlink activation) on live screen.
     pub fn url_at(&self, row: usize, col: usize) -> Option<(String, ((usize, usize), (usize, usize)))> {
         self.url_at_with_offset(row, col, 0)
     }
 
-    /// Find an HTTP/HTTPS URL at the specified cell taking `display_offset` into account.
+    /// Find a URL or hyperlink (HTTP/HTTPS/file or markdown link) at the specified cell taking `display_offset` into account.
     pub fn url_at_with_offset(
         &self,
         row: usize,
@@ -295,8 +302,59 @@ impl Grid {
             .iter()
             .map(|c| if c.c == '\0' { ' ' } else { c.c })
             .collect();
+
+        // 1. Detect Markdown links: [Label](URL) or [`Label`](URL)
+        let mut idx = 0;
+        while idx < line_chars.len() {
+            if line_chars[idx] == '[' {
+                let start_idx = idx;
+                let mut sep_idx = None;
+                let mut j = start_idx + 1;
+                while j < line_chars.len() {
+                    if line_chars[j] == '[' {
+                        break;
+                    }
+                    if line_chars[j] == ']' && j + 1 < line_chars.len() && line_chars[j + 1] == '(' {
+                        sep_idx = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+
+                if let Some(sep) = sep_idx {
+                    let mut end_paren = None;
+                    let mut k = sep + 2;
+                    while k < line_chars.len() {
+                        if line_chars[k] == ')' {
+                            end_paren = Some(k);
+                            break;
+                        }
+                        if line_chars[k].is_whitespace() || line_chars[k] == '(' || line_chars[k] == '[' {
+                            break;
+                        }
+                        k += 1;
+                    }
+
+                    if let Some(close_paren) = end_paren {
+                        let raw_url: String = line_chars[sep + 2..close_paren].iter().collect();
+                        let url = raw_url.trim_matches(|c| c == '<' || c == '>').trim().to_string();
+                        if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("file://") {
+                            if col >= start_idx && col <= close_paren {
+                                return Some((url, ((row, start_idx), (row, close_paren))));
+                            }
+                            idx = close_paren + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            idx += 1;
+        }
+
+        // 2. Detect Standalone URLs (https://, http://, file://)
         let https_prefix = ['h', 't', 't', 'p', 's', ':', '/', '/'];
         let http_prefix = ['h', 't', 't', 'p', ':', '/', '/'];
+        let file_prefix = ['f', 'i', 'l', 'e', ':', '/', '/'];
 
         let mut i = 0;
         while i < line_chars.len() {
@@ -304,6 +362,8 @@ impl Grid {
                 https_prefix.len()
             } else if line_chars[i..].starts_with(&http_prefix) {
                 http_prefix.len()
+            } else if line_chars[i..].starts_with(&file_prefix) {
+                file_prefix.len()
             } else {
                 i += 1;
                 continue;
