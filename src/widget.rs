@@ -6,15 +6,59 @@
 //! zero-copy Vulkan dmabufs, and displays via GTK snapshot.
 
 use std::cell::RefCell;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::graphene;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
+
+fn unix_fd_add_local<F>(fd: i32, condition: glib::IOCondition, func: F) -> glib::SourceId
+where
+    F: FnMut(i32, glib::IOCondition) -> glib::ControlFlow + 'static,
+{
+    unsafe extern "C" {
+        fn g_unix_fd_add_full(
+            priority: i32,
+            fd: i32,
+            condition: u32,
+            function: Option<unsafe extern "C" fn(i32, u32, *mut std::ffi::c_void) -> i32>,
+            user_data: *mut std::ffi::c_void,
+            notify: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ) -> u32;
+    }
+
+    unsafe extern "C" fn trampoline<F: FnMut(i32, glib::IOCondition) -> glib::ControlFlow + 'static>(
+        fd: i32,
+        condition: u32,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let f = unsafe { &mut *(user_data as *mut F) };
+        let cond = glib::IOCondition::from_bits_truncate(condition);
+        match f(fd, cond) {
+            glib::ControlFlow::Continue => 1,
+            glib::ControlFlow::Break => 0,
+        }
+    }
+
+    unsafe extern "C" fn destroy<F>(user_data: *mut std::ffi::c_void) {
+        let _ = unsafe { Box::from_raw(user_data as *mut F) };
+    }
+
+    let boxed: Box<F> = Box::new(func);
+    unsafe {
+        let id = g_unix_fd_add_full(
+            0, // G_PRIORITY_DEFAULT
+            fd,
+            condition.bits(),
+            Some(trampoline::<F>),
+            Box::into_raw(boxed) as *mut std::ffi::c_void,
+            Some(destroy::<F>),
+        );
+        glib::translate::from_glib(id)
+    }
+}
 
 use crate::pty::Pty;
 use crate::render::dmabuf::DmabufFrame;
@@ -46,6 +90,8 @@ mod imp {
         pub drag_start: RefCell<Option<(usize, usize)>>,
         pub custom_title: RefCell<Option<String>>,
         pub dpi_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub pty_source_id: RefCell<Option<glib::SourceId>>,
+        pub im_context: gtk4::IMMulticontext,
     }
 
     #[derive(Default)]
@@ -85,6 +131,10 @@ mod imp {
 
         fn dispose(&self) {
             if let Some(inner) = self.inner.borrow_mut().take() {
+                inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+                if let Some(source_id) = inner.pty_source_id.borrow_mut().take() {
+                    source_id.remove();
+                }
                 if let Some(id) = inner.dpi_handler_id.borrow_mut().take() {
                     if let Some(settings) = gtk4::Settings::default() {
                         settings.disconnect(id);
@@ -152,6 +202,10 @@ mod imp {
             };
 
             if needs_new_frames {
+                if frames_guard[0].is_some() || frames_guard[1].is_some() {
+                    *frames_guard = [None, None];
+                    let _ = inner.device.poll(wgpu::PollType::wait_indefinitely());
+                }
                 let f0 = match DmabufFrame::new(&inner.device, pixel_w, pixel_h) {
                     Ok(frame) => frame,
                     Err(e) => {
@@ -247,6 +301,10 @@ impl TerminalView {
     /// Explicitly terminate the terminal, killing the child process group and releasing all GPU/memory resources.
     pub fn terminate(&self) {
         if let Some(inner) = self.imp().inner.borrow_mut().take() {
+            inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+            if let Some(source_id) = inner.pty_source_id.borrow_mut().take() {
+                source_id.remove();
+            }
             if let Some(id) = inner.dpi_handler_id.borrow_mut().take() {
                 if let Some(settings) = gtk4::Settings::default() {
                     settings.disconnect(id);
@@ -254,6 +312,12 @@ impl TerminalView {
             }
             if let Ok(mut pty) = inner.pty.lock() {
                 pty.terminate();
+            }
+            let device = inner.device.clone();
+            drop(inner);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            unsafe {
+                libc::malloc_trim(0);
             }
         }
     }
@@ -348,9 +412,15 @@ impl TerminalView {
         let init_w = ((init_cols as f32 * cell_w) / scale as f32).ceil() as u32;
         let init_h = ((init_rows as f32 * cell_h) / scale as f32).ceil() as u32;
 
+        let master_fd = pty.lock().unwrap().raw_fd();
+
+        let im_context = gtk4::IMMulticontext::new();
+        im_context.set_client_widget(Some(&widget));
+        im_context.focus_in();
+
         let inner = imp::TerminalViewInner {
-            pty: pty.clone(),
-            terminal: terminal.clone(),
+            pty,
+            terminal,
             renderer: RefCell::new(renderer),
             device,
             queue,
@@ -370,114 +440,117 @@ impl TerminalView {
             drag_start: RefCell::new(None),
             custom_title: RefCell::new(None),
             dpi_handler_id: RefCell::new(None),
+            pty_source_id: RefCell::new(None),
+            im_context: im_context.clone(),
         };
 
         widget.imp().inner.replace(Some(inner));
 
-        // Setup background PTY reader thread with a bounded channel for backpressure
-        let reader = pty.lock().unwrap().reader()?;
-        let (sender, receiver) = async_channel::bounded::<Vec<u8>>(128);
+        // Poll PTY master FD directly on the GTK main loop without spawning per-tab OS threads
+        let widget_weak = widget.downgrade();
+        let source_id = unix_fd_add_local(
+            master_fd,
+            glib::IOCondition::IN | glib::IOCondition::HUP | glib::IOCondition::ERR,
+            move |_fd, _cond| {
+                let widget = match widget_weak.upgrade() {
+                    Some(w) => w,
+                    None => return glib::ControlFlow::Break,
+                };
 
-        thread::Builder::new()
-            .name("pty-reader".into())
-            .spawn(move || {
-                let mut reader = reader;
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            let _ = sender.send_blocking(Vec::new());
-                            break;
-                        }
-                        Ok(n) => {
-                            if sender.send_blocking(buf[..n].to_vec()).is_err() {
+                let mut exited = false;
+                let mut read_any = false;
+                let mut buf = [0u8; 8192];
+
+                {
+                    let inner_guard = widget.imp().inner.borrow();
+                    let inner = match inner_guard.as_ref() {
+                        Some(i) => i,
+                        None => return glib::ControlFlow::Break,
+                    };
+
+                    let mut total_read = 0usize;
+                    while total_read < 64 * 1024 {
+                        let read_res = match inner.pty.lock() {
+                            Ok(pty) => pty.try_read(&mut buf),
+                            Err(_) => break,
+                        };
+                        match read_res {
+                            Ok(0) => {
+                                exited = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                read_any = true;
+                                total_read += n;
+                                if let Ok(mut term) = inner.terminal.lock() {
+                                    term.advance(&buf[..n]);
+                                    let responses = term.take_responses();
+                                    if !responses.is_empty() {
+                                        if let Ok(pty) = inner.pty.lock() {
+                                            let _ = pty.write_all(&responses);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::Interrupted =>
+                            {
+                                break;
+                            }
+                            Err(_) => {
+                                exited = true;
                                 break;
                             }
                         }
-                        Err(_) => {
-                            let _ = sender.send_blocking(Vec::new());
-                            break;
-                        }
+                    }
+
+                    if exited {
+                        *inner.pty_source_id.borrow_mut() = None;
                     }
                 }
-            })?;
 
-        // Handle PTY input on the main GTK loop
-        let term_clone = terminal.clone();
-        let pty_clone = pty.clone();
-        let widget_weak = widget.downgrade();
+                if read_any {
+                    widget.queue_draw();
+                }
 
-        glib::spawn_future_local(async move {
-            while let Ok(data) = receiver.recv().await {
-                let widget = match widget_weak.upgrade() {
-                    Some(w) => w,
-                    None => break,
-                };
-
-                if data.is_empty() {
+                if exited {
                     widget.emit_by_name::<()>("child-exited", &[]);
-                    break;
+                    return glib::ControlFlow::Break;
                 }
 
-                // Batch multiple chunks up to 64KB per iteration to minimize locking and redraw calls
-                let mut batch = data;
-                let mut had_more = false;
-                while batch.len() < 64 * 1024 {
-                    match receiver.try_recv() {
-                        Ok(more) if !more.is_empty() => {
-                            batch.extend_from_slice(&more);
-                            had_more = true;
-                        }
-                        _ => break,
-                    }
-                }
+                glib::ControlFlow::Continue
+            },
+        );
 
-                if let Ok(mut term) = term_clone.lock() {
-                    term.advance(&batch);
-                    let responses = term.take_responses();
-                    if !responses.is_empty() {
-                        if let Ok(pty) = pty_clone.lock() {
-                            let _ = pty.write_all(&responses);
-                        }
-                    }
-                }
-                widget.queue_draw();
-
-                // If high throughput was received, cooperatively yield to the GTK main loop
-                // to keep UI input, frame rendering, and window responsiveness smooth
-                if had_more || batch.len() >= 32 * 1024 {
-                    glib::timeout_future(std::time::Duration::from_millis(0)).await;
-                }
-            }
-        });
+        if let Some(inner) = widget.imp().inner.borrow().as_ref() {
+            *inner.pty_source_id.borrow_mut() = Some(source_id);
+        }
 
         // Setup keyboard controller
         let key_controller = gtk4::EventControllerKey::new();
-        
-        let im_context = gtk4::IMMulticontext::new();
-        im_context.set_client_widget(Some(&widget));
-        im_context.focus_in();
         key_controller.set_im_context(Some(&im_context));
-        
-        let pty_for_im = pty.clone();
-        let term_for_im = terminal.clone();
+
         let widget_for_im = widget.downgrade();
         im_context.connect_commit(move |_, text| {
-            if let Ok(mut term) = term_for_im.lock() {
-                if term.display_offset() > 0 {
-                    term.scroll_to_bottom();
-                    if let Some(w) = widget_for_im.upgrade() {
-                        w.queue_draw();
+            if let Some(w) = widget_for_im.upgrade() {
+                let mut need_draw = false;
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if let Ok(mut term) = inner.terminal.lock() {
+                        if term.display_offset() > 0 {
+                            term.scroll_to_bottom();
+                            need_draw = true;
+                        }
+                    }
+                    if let Ok(pty) = inner.pty.lock() {
+                        let _ = pty.write_all(text.as_bytes());
                     }
                 }
-            }
-            if let Ok(pty) = pty_for_im.lock() {
-                let _ = pty.write_all(text.as_bytes());
+                if need_draw {
+                    w.queue_draw();
+                }
             }
         });
-
-        let pty_for_keys = pty.clone();
-        let term_for_keys = terminal.clone();
 
         // Setup Actions for Context Menu
         let action_group = gtk4::gio::SimpleActionGroup::new();
@@ -508,65 +581,74 @@ impl TerminalView {
             let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
             let is_alt = state.contains(gdk::ModifierType::ALT_MASK);
 
-            if let Some(w) = widget_for_keys.upgrade() {
-                if let Some(inner) = w.imp().inner.borrow().as_ref() {
-                    if keyval == gdk::Key::Control_L || keyval == gdk::Key::Control_R || is_ctrl {
-                        *inner.ctrl_pressed.borrow_mut() = true;
-                        if let Some((x, y)) = *inner.last_mouse_pos.borrow() {
-                            if let Some((row, col)) = w.pixel_to_cell(x, y) {
-                                if let Ok(term) = inner.terminal.lock() {
-                                    if let Some((url, span)) = term.url_at(row, col) {
-                                        w.set_cursor_from_name(Some("pointer"));
-                                        *inner.hovered_link.borrow_mut() = Some(span);
-                                        *inner.hovered_url.borrow_mut() = Some(url);
-                                        w.queue_draw();
-                                    }
+            let w = match widget_for_keys.upgrade() {
+                Some(w) => w,
+                None => return glib::Propagation::Proceed,
+            };
+
+            let (term_for_keys, pty_for_keys) = {
+                let inner_guard = w.imp().inner.borrow();
+                let inner = match inner_guard.as_ref() {
+                    Some(i) => i,
+                    None => return glib::Propagation::Proceed,
+                };
+                if keyval == gdk::Key::Control_L || keyval == gdk::Key::Control_R || is_ctrl {
+                    *inner.ctrl_pressed.borrow_mut() = true;
+                    if let Some((x, y)) = *inner.last_mouse_pos.borrow() {
+                        if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                            if let Ok(term) = inner.terminal.lock() {
+                                if let Some((url, span)) = term.url_at(row, col) {
+                                    w.set_cursor_from_name(Some("pointer"));
+                                    *inner.hovered_link.borrow_mut() = Some(span);
+                                    *inner.hovered_url.borrow_mut() = Some(url);
+                                    w.queue_draw();
                                 }
                             }
                         }
                     }
                 }
+                (inner.terminal.clone(), inner.pty.clone())
+            };
 
-                // Ctrl+Shift shortcuts (Copy, Paste, Move Tab Left/Right)
-                if is_ctrl && is_shift {
-                    match keyval {
-                        gdk::Key::C | gdk::Key::c => {
-                            w.copy_selection();
-                            return glib::Propagation::Stop;
-                        }
-                        gdk::Key::V | gdk::Key::v => {
-                            w.paste_clipboard();
-                            return glib::Propagation::Stop;
-                        }
-                        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
-                            if w.activate_action("win.move-tab-left", None).is_ok() {
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
-                            if w.activate_action("win.move-tab-right", None).is_ok() {
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                        _ => {}
+            // Ctrl+Shift shortcuts (Copy, Paste, Move Tab Left/Right)
+            if is_ctrl && is_shift {
+                match keyval {
+                    gdk::Key::C | gdk::Key::c => {
+                        w.copy_selection();
+                        return glib::Propagation::Stop;
                     }
+                    gdk::Key::V | gdk::Key::v => {
+                        w.paste_clipboard();
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
+                        if w.activate_action("win.move-tab-left", None).is_ok() {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
+                        if w.activate_action("win.move-tab-right", None).is_ok() {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    _ => {}
                 }
+            }
 
-                // Ctrl shortcuts (Previous/Next Tab)
-                if is_ctrl && !is_shift {
-                    match keyval {
-                        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
-                            if w.activate_action("win.prev-tab", None).is_ok() {
-                                return glib::Propagation::Stop;
-                            }
+            // Ctrl shortcuts (Previous/Next Tab)
+            if is_ctrl && !is_shift {
+                match keyval {
+                    gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
+                        if w.activate_action("win.prev-tab", None).is_ok() {
+                            return glib::Propagation::Stop;
                         }
-                        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
-                            if w.activate_action("win.next-tab", None).is_ok() {
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                        _ => {}
                     }
+                    gdk::Key::Page_Down | gdk::Key::KP_Page_Down => {
+                        if w.activate_action("win.next-tab", None).is_ok() {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -814,8 +896,6 @@ impl TerminalView {
         let scroll_controller = gtk4::EventControllerScroll::new(
             gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
         );
-        let term_for_scroll = terminal.clone();
-        let pty_for_scroll = pty.clone();
         let widget_for_scroll = widget.downgrade();
 
         scroll_controller.connect_scroll(move |controller, _dx, dy| {
@@ -824,6 +904,18 @@ impl TerminalView {
             if state.contains(gdk::ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
             }
+
+            let w = match widget_for_scroll.upgrade() {
+                Some(w) => w,
+                None => return glib::Propagation::Proceed,
+            };
+            let (term_for_scroll, pty_for_scroll) = {
+                let inner_guard = w.imp().inner.borrow();
+                match inner_guard.as_ref() {
+                    Some(i) => (i.terminal.clone(), i.pty.clone()),
+                    None => return glib::Propagation::Proceed,
+                }
+            };
 
             let mut term = match term_for_scroll.lock() {
                 Ok(t) => t,
@@ -855,9 +947,7 @@ impl TerminalView {
             term.scroll_display(lines);
             drop(term);
 
-            if let Some(w) = widget_for_scroll.upgrade() {
-                w.queue_draw();
-            }
+            w.queue_draw();
 
             glib::Propagation::Stop
         });
@@ -880,8 +970,7 @@ impl TerminalView {
         });
 
         let drag_update_w = widget.downgrade();
-        let drag_gesture_update = drag_controller.clone();
-        drag_controller.connect_drag_update(move |_, offset_x, offset_y| {
+        drag_controller.connect_drag_update(move |drag_gesture_update, offset_x, offset_y| {
             if let Some(w) = drag_update_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
                     if let Some(start_pos) = *inner.drag_start.borrow() {
@@ -990,8 +1079,7 @@ impl TerminalView {
         // Motion controller for hover link detection
         let motion_controller = gtk4::EventControllerMotion::new();
         let motion_w = widget.downgrade();
-        let motion_ctrl = motion_controller.clone();
-        motion_controller.connect_motion(move |_, x, y| {
+        motion_controller.connect_motion(move |motion_ctrl, x, y| {
             if let Some(w) = motion_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
                     *inner.last_mouse_pos.borrow_mut() = Some((x, y));
@@ -1076,6 +1164,19 @@ impl TerminalView {
                     if w.sync_scale_and_dimensions(log_w, log_h) {
                         w.queue_draw();
                     }
+                }
+            }
+        });
+
+        // Release double-buffered DMA-BUF textures when the terminal is unmapped (e.g., background tab)
+        // so inactive tabs do not hold ~8-16 MB of GPU/system RAM each.
+        widget.connect_unmap(|w| {
+            if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                let mut frames = inner.frames.borrow_mut();
+                if frames[0].is_some() || frames[1].is_some() {
+                    *frames = [None, None];
+                    drop(frames);
+                    let _ = inner.device.poll(wgpu::PollType::wait_indefinitely());
                 }
             }
         });
@@ -1472,6 +1573,195 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let status = unsafe { libc::kill(child_pid as i32, 0) };
         assert_ne!(status, 0);
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct MemStats {
+        vm_size: usize,
+        vm_rss: usize,
+        rss_anon: usize,
+        rss_file: usize,
+        rss_shmem: usize,
+        threads: usize,
+        fds: usize,
+    }
+
+    fn read_mem_stats() -> MemStats {
+        let mut s = MemStats::default();
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(val) = parts[1].parse::<usize>() {
+                        match parts[0] {
+                            "VmSize:" => s.vm_size = val,
+                            "VmRSS:" => s.vm_rss = val,
+                            "RssAnon:" => s.rss_anon = val,
+                            "RssFile:" => s.rss_file = val,
+                            "RssShmem:" => s.rss_shmem = val,
+                            "Threads:" => s.threads = val,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+            s.fds = dir.count();
+        }
+        s
+    }
+
+    #[test]
+    fn test_open_close_tabs_memory_leak() {
+        if gtk4::is_initialized() {
+            if !gtk4::is_initialized_main_thread() {
+                return;
+            }
+        } else if gtk4::init().is_err() {
+            return;
+        }
+
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let notebook = gtk4::Notebook::new();
+
+        // Warmup 1 tab and close it to initialize font db, shaders, GTK, etc.
+        {
+            let warm = TerminalView::with_working_dir(device.clone(), queue.clone(), None, 14.0, None).unwrap();
+            warm.sync_scale_and_dimensions(1200, 800);
+            if let Some(inner) = warm.imp().inner.borrow().as_ref() {
+                let f0 = DmabufFrame::new(&inner.device, 1200, 800).unwrap();
+                let f1 = DmabufFrame::new(&inner.device, 1200, 800).unwrap();
+                let mut term = inner.terminal.lock().unwrap();
+                term.advance(b"user@host:~/Code/rust/WhattyTheShell!$ ls -la\r\ndrwxr-xr-x 10 user user 4096 Nov 2 15:36 .\r\n");
+                inner.renderer.borrow_mut().render(
+                    &inner.device,
+                    &inner.queue,
+                    &f0.view,
+                    1200,
+                    800,
+                    term.grid(),
+                    &term.state.cursor,
+                    true,
+                    0,
+                    None,
+                    None,
+                );
+                let _ = inner.device.poll(wgpu::PollType::wait_indefinitely());
+                let _ = f0.build_gdk_texture(&warm.display(), || {});
+                *inner.frames.borrow_mut() = [Some(f0), Some(f1)];
+            }
+            warm.terminate();
+            drop(warm);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+
+        while glib::MainContext::default().iteration(false) {}
+        let mem_baseline = read_mem_stats();
+
+        let mut after_cycle_rss = Vec::new();
+
+        for cycle in 1..=3 {
+            let mut weak_views = Vec::new();
+            let mut weak_tab_boxes = Vec::new();
+            let mut weak_popovers = Vec::new();
+            for _ in 0..15 {
+                let v = TerminalView::with_working_dir(device.clone(), queue.clone(), None, 14.0, None).unwrap();
+                v.sync_scale_and_dimensions(1200, 800);
+                if let Some(inner) = v.imp().inner.borrow().as_ref() {
+                    let f0 = DmabufFrame::new(&inner.device, 1200, 800).unwrap();
+                    let f1 = DmabufFrame::new(&inner.device, 1200, 800).unwrap();
+                    let mut term = inner.terminal.lock().unwrap();
+                    term.advance(b"user@host:~/Code/rust/WhattyTheShell!$ ls -la\r\ndrwxr-xr-x 10 user user 4096 Nov 2 15:36 .\r\n");
+                    inner.renderer.borrow_mut().render(
+                        &inner.device,
+                        &inner.queue,
+                        &f0.view,
+                        1200,
+                        800,
+                        term.grid(),
+                        &term.state.cursor,
+                        true,
+                        0,
+                        None,
+                        None,
+                    );
+                    let _ = inner.device.poll(wgpu::PollType::wait_indefinitely());
+                    let _ = f0.build_gdk_texture(&v.display(), || {});
+                    *inner.frames.borrow_mut() = [Some(f0), Some(f1)];
+                }
+
+                let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                let pop = gtk4::Popover::new();
+                pop.set_parent(&tab_box);
+                notebook.append_page(&v, Some(&tab_box));
+
+                weak_views.push(v.downgrade());
+                weak_tab_boxes.push(tab_box.downgrade());
+                weak_popovers.push(pop.downgrade());
+            }
+
+            while glib::MainContext::default().iteration(false) {}
+
+            while notebook.n_pages() > 0 {
+                if let Some(page) = notebook.nth_page(Some(0)) {
+                    for tv in crate::split::find_terminals(&page) {
+                        tv.terminate();
+                    }
+                    crate::split::cleanup_tab_label(&notebook, &page);
+                }
+                notebook.remove_page(Some(0));
+            }
+
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            while glib::MainContext::default().iteration(false) {}
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            unsafe {
+                libc::malloc_trim(0);
+            }
+
+            let alive_views = weak_views.iter().filter(|w| w.upgrade().is_some()).count();
+            let alive_boxes = weak_tab_boxes.iter().filter(|w| w.upgrade().is_some()).count();
+            let alive_pops = weak_popovers.iter().filter(|w| w.upgrade().is_some()).count();
+            let mem_after = read_mem_stats();
+            after_cycle_rss.push(mem_after.vm_rss);
+
+            assert_eq!(alive_views, 0, "TerminalView GObjects leaked in cycle {cycle}!");
+            assert_eq!(alive_boxes, 0, "Tab header Box GObjects leaked in cycle {cycle}!");
+            assert_eq!(alive_pops, 0, "Tab Popover GObjects leaked in cycle {cycle}!");
+            assert!(
+                mem_after.fds <= mem_baseline.fds + 2,
+                "File descriptors leaked in cycle {cycle}: baseline={}, after={}",
+                mem_baseline.fds,
+                mem_after.fds
+            );
+        }
+
+        let growth_c1_to_c3 = after_cycle_rss[2].saturating_sub(after_cycle_rss[0]);
+        assert!(
+            growth_c1_to_c3 < 4096,
+            "Memory continued growing across tab open/close cycles: cycle 1 RSS={} KB, cycle 3 RSS={} KB (+{} KB)",
+            after_cycle_rss[0],
+            after_cycle_rss[2],
+            growth_c1_to_c3
+        );
     }
 }
 

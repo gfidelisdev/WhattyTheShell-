@@ -363,9 +363,14 @@ fn main() {
                 for tv in terminals {
                     tv.terminate();
                 }
+
+                split::cleanup_tab_label(notebook, &page);
             }
 
             notebook.remove_page(Some(page_idx));
+            unsafe {
+                libc::malloc_trim(0);
+            }
             if notebook.n_pages() == 0 {
                 window.close();
             } else if let Some(current) = notebook.current_page() {
@@ -576,11 +581,13 @@ fn main() {
                         let nb_for_cb = notebook.clone();
                         let win_for_cb = window.clone();
                         let cfg_for_cb = cfg_for_tab.clone();
-                        let tab_box_for_close = tab_box.clone();
+                        let tab_box_for_close = tab_box.downgrade();
                         let active_term_for_tab_close = active_terminal_for_tab.clone();
                         tab_close_btn.connect_clicked(move |_| {
-                            if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_cb, &tab_box_for_close.clone().upcast()) {
-                                close_tab_page(&nb_for_cb, &win_for_cb, &cfg_for_cb, &active_term_for_tab_close, idx);
+                            if let Some(tb) = tab_box_for_close.upgrade() {
+                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_cb, &tb.upcast()) {
+                                    close_tab_page(&nb_for_cb, &win_for_cb, &cfg_for_cb, &active_term_for_tab_close, idx);
+                                }
                             }
                         });
                         tab_box.append(&tab_close_btn);
@@ -623,19 +630,28 @@ fn main() {
 
                         // Helper to trigger tab renaming popover
                         let start_rename = {
-                            let rename_popover = rename_popover.clone();
-                            let rename_entry = rename_entry.clone();
-                            let label = label.clone();
-                            let view = view.clone();
+                            let rename_popover = rename_popover.downgrade();
+                            let rename_entry = rename_entry.downgrade();
+                            let label = label.downgrade();
+                            let view = view.downgrade();
                             std::rc::Rc::new(move || {
-                                let current_title = view.custom_title().unwrap_or_else(|| label.text().to_string());
-                                rename_entry.set_text(&current_title);
-                                rename_popover.popup();
-                                let e = rename_entry.clone();
-                                glib::idle_add_local_once(move || {
-                                    e.grab_focus();
-                                    e.select_region(0, -1);
-                                });
+                                if let (Some(rename_popover), Some(rename_entry), Some(label), Some(view)) = (
+                                    rename_popover.upgrade(),
+                                    rename_entry.upgrade(),
+                                    label.upgrade(),
+                                    view.upgrade(),
+                                ) {
+                                    let current_title = view.custom_title().unwrap_or_else(|| label.text().to_string());
+                                    rename_entry.set_text(&current_title);
+                                    rename_popover.popup();
+                                    let e = rename_entry.downgrade();
+                                    glib::idle_add_local_once(move || {
+                                        if let Some(e) = e.upgrade() {
+                                            e.grab_focus();
+                                            e.select_region(0, -1);
+                                        }
+                                    });
+                                }
                             })
                         };
 
@@ -643,31 +659,38 @@ fn main() {
                         {
                             let last_seen_for_commit = last_seen_cwd.clone();
                             let commit_rename = {
-                                let rename_popover = rename_popover.clone();
-                                let rename_entry = rename_entry.clone();
-                                let label = label.clone();
-                                let view = view.clone();
+                                let rename_popover = rename_popover.downgrade();
+                                let rename_entry = rename_entry.downgrade();
+                                let label = label.downgrade();
+                                let view = view.downgrade();
                                 move || {
-                                    let text = rename_entry.text().trim().to_string();
-                                    if !text.is_empty() {
-                                        view.set_custom_title(Some(text.clone()));
-                                        let display_title = truncate_middle(&text, 32);
-                                        label.set_text(&display_title);
-                                        label.set_tooltip_text(Some(&text));
-                                    } else {
-                                        view.set_custom_title(None);
-                                        *last_seen_for_commit.borrow_mut() = None;
-                                        let cwd = view.current_working_dir()
-                                            .or_else(|| std::env::current_dir().ok());
-                                        if let Some(ref path) = cwd {
-                                            *last_seen_for_commit.borrow_mut() = Some(path.clone());
-                                            let formatted = format_dir_path(path);
-                                            label.set_text(&formatted);
-                                            label.set_tooltip_text(Some(&path.to_string_lossy()));
+                                    if let (Some(rename_popover), Some(rename_entry), Some(label), Some(view)) = (
+                                        rename_popover.upgrade(),
+                                        rename_entry.upgrade(),
+                                        label.upgrade(),
+                                        view.upgrade(),
+                                    ) {
+                                        let text = rename_entry.text().trim().to_string();
+                                        if !text.is_empty() {
+                                            view.set_custom_title(Some(text.clone()));
+                                            let display_title = truncate_middle(&text, 32);
+                                            label.set_text(&display_title);
+                                            label.set_tooltip_text(Some(&text));
+                                        } else {
+                                            view.set_custom_title(None);
+                                            *last_seen_for_commit.borrow_mut() = None;
+                                            let cwd = view.current_working_dir()
+                                                .or_else(|| std::env::current_dir().ok());
+                                            if let Some(ref path) = cwd {
+                                                *last_seen_for_commit.borrow_mut() = Some(path.clone());
+                                                let formatted = format_dir_path(path);
+                                                label.set_text(&formatted);
+                                                label.set_tooltip_text(Some(&path.to_string_lossy()));
+                                            }
                                         }
+                                        rename_popover.popdown();
+                                        view.grab_focus();
                                     }
-                                    rename_popover.popdown();
-                                    view.grab_focus();
                                 }
                             };
 
@@ -684,11 +707,15 @@ fn main() {
 
                         // Cancel editing on Escape or click Cancelar
                         {
-                            let rename_popover = rename_popover.clone();
-                            let view = view.clone();
+                            let rename_popover = rename_popover.downgrade();
+                            let view = view.downgrade();
                             let cancel_rename = move || {
-                                rename_popover.popdown();
-                                view.grab_focus();
+                                if let Some(pop) = rename_popover.upgrade() {
+                                    pop.popdown();
+                                }
+                                if let Some(v) = view.upgrade() {
+                                    v.grab_focus();
+                                }
                             };
 
                             let cancel_for_btn = cancel_rename.clone();
@@ -722,10 +749,12 @@ fn main() {
 
                         // 1. Renomear Aba...
                         let rename_btn = create_menu_item("Renomear Aba...", "edit-rename-symbolic");
-                        let pop_rename = popover.clone();
+                        let pop_rename = popover.downgrade();
                         let start_rename_for_btn = start_rename.clone();
                         rename_btn.connect_clicked(move |_| {
-                            pop_rename.popdown();
+                            if let Some(pop) = pop_rename.upgrade() {
+                                pop.popdown();
+                            }
                             start_rename_for_btn();
                         });
                         menu_box.append(&rename_btn);
@@ -733,40 +762,48 @@ fn main() {
                         // 2. Restaurar Nome Automático (Caminho da Pasta)
                         let restore_name_btn = create_menu_item("Restaurar Nome Automático", "view-refresh-symbolic");
                         restore_name_btn.set_tooltip_text(Some("Voltar a exibir automaticamente o caminho da pasta"));
-                        let pop_restore = popover.clone();
-                        let view_for_restore = view.clone();
-                        let label_for_restore = label.clone();
+                        let pop_restore = popover.downgrade();
+                        let view_for_restore = view.downgrade();
+                        let label_for_restore = label.downgrade();
                         let last_seen_for_restore = last_seen_cwd.clone();
                         restore_name_btn.connect_clicked(move |_| {
-                            pop_restore.popdown();
-                            view_for_restore.set_custom_title(None);
-                            *last_seen_for_restore.borrow_mut() = None;
-                            let cwd = view_for_restore.current_working_dir()
-                                .or_else(|| std::env::current_dir().ok());
-                            if let Some(ref path) = cwd {
-                                *last_seen_for_restore.borrow_mut() = Some(path.clone());
-                                let formatted = format_dir_path(path);
-                                label_for_restore.set_text(&formatted);
-                                label_for_restore.set_tooltip_text(Some(&path.to_string_lossy()));
+                            if let Some(pop) = pop_restore.upgrade() {
+                                pop.popdown();
                             }
-                            view_for_restore.grab_focus();
+                            if let (Some(view_for_restore), Some(label_for_restore)) = (view_for_restore.upgrade(), label_for_restore.upgrade()) {
+                                view_for_restore.set_custom_title(None);
+                                *last_seen_for_restore.borrow_mut() = None;
+                                let cwd = view_for_restore.current_working_dir()
+                                    .or_else(|| std::env::current_dir().ok());
+                                if let Some(ref path) = cwd {
+                                    *last_seen_for_restore.borrow_mut() = Some(path.clone());
+                                    let formatted = format_dir_path(path);
+                                    label_for_restore.set_text(&formatted);
+                                    label_for_restore.set_tooltip_text(Some(&path.to_string_lossy()));
+                                }
+                                view_for_restore.grab_focus();
+                            }
                         });
                         menu_box.append(&restore_name_btn);
 
                         // 3. Duplicar Aba
                         let dup_btn = create_menu_item("Duplicar Aba", "tab-new-symbolic");
-                        let pop_dup = popover.clone();
+                        let pop_dup = popover.downgrade();
                         let nb_for_dup = notebook.clone();
                         let win_for_dup = window.clone();
-                        let view_for_dup = view.clone();
+                        let view_for_dup = view.downgrade();
                         let create_tab_cell_dup = create_tab_cell.clone();
-                        let label_for_dup = label.clone();
+                        let label_for_dup = label.downgrade();
                         dup_btn.connect_clicked(move |_| {
-                            pop_dup.popdown();
-                            let cwd = view_for_dup.current_working_dir();
-                            let dup_title = format!("{} (cópia)", label_for_dup.text());
-                            if let Some(ref cb) = *create_tab_cell_dup.borrow() {
-                                cb(&nb_for_dup, &win_for_dup, cwd.as_deref(), Some(&dup_title));
+                            if let Some(pop) = pop_dup.upgrade() {
+                                pop.popdown();
+                            }
+                            if let (Some(view_for_dup), Some(label_for_dup)) = (view_for_dup.upgrade(), label_for_dup.upgrade()) {
+                                let cwd = view_for_dup.current_working_dir();
+                                let dup_title = format!("{} (cópia)", label_for_dup.text());
+                                if let Some(ref cb) = *create_tab_cell_dup.borrow() {
+                                    cb(&nb_for_dup, &win_for_dup, cwd.as_deref(), Some(&dup_title));
+                                }
                             }
                         });
                         menu_box.append(&dup_btn);
@@ -777,16 +814,20 @@ fn main() {
                             if is_vert { "Mover Aba para Cima" } else { "Mover Aba para a Esquerda" },
                             if is_vert { "go-up-symbolic" } else { "go-previous-symbolic" },
                         );
-                        let pop_move_prev = popover.clone();
+                        let pop_move_prev = popover.downgrade();
                         let nb_for_move_prev = notebook.clone();
-                        let view_for_move_prev = view.clone();
+                        let view_for_move_prev = view.downgrade();
                         move_prev_btn.connect_clicked(move |_| {
-                            pop_move_prev.popdown();
-                            if let Some((idx, root)) = page_root_for_view(&nb_for_move_prev, &view_for_move_prev) {
-                                if idx > 0 {
-                                    nb_for_move_prev.reorder_child(&root, Some(idx - 1));
-                                    nb_for_move_prev.set_current_page(Some(idx - 1));
-                                    view_for_move_prev.grab_focus();
+                            if let Some(pop) = pop_move_prev.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(view_for_move_prev) = view_for_move_prev.upgrade() {
+                                if let Some((idx, root)) = page_root_for_view(&nb_for_move_prev, &view_for_move_prev) {
+                                    if idx > 0 {
+                                        nb_for_move_prev.reorder_child(&root, Some(idx - 1));
+                                        nb_for_move_prev.set_current_page(Some(idx - 1));
+                                        view_for_move_prev.grab_focus();
+                                    }
                                 }
                             }
                         });
@@ -797,17 +838,21 @@ fn main() {
                             if is_vert { "Mover Aba para Baixo" } else { "Mover Aba para a Direita" },
                             if is_vert { "go-down-symbolic" } else { "go-next-symbolic" },
                         );
-                        let pop_move_next = popover.clone();
+                        let pop_move_next = popover.downgrade();
                         let nb_for_move_next = notebook.clone();
-                        let tab_box_for_move_next = tab_box.clone();
+                        let tab_box_for_move_next = tab_box.downgrade();
                         move_next_btn.connect_clicked(move |_| {
-                            pop_move_next.popdown();
-                            if let Some((idx, root)) = split::find_page_by_tab_label(&nb_for_move_next, &tab_box_for_move_next.clone().upcast()) {
-                                if idx + 1 < nb_for_move_next.n_pages() {
-                                    nb_for_move_next.reorder_child(&root, Some(idx + 1));
-                                    nb_for_move_next.set_current_page(Some(idx + 1));
-                                    if let Some(target) = split::find_focused_terminal(&root) {
-                                        target.grab_focus();
+                            if let Some(pop) = pop_move_next.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_move_next.upgrade() {
+                                if let Some((idx, root)) = split::find_page_by_tab_label(&nb_for_move_next, &tb.upcast()) {
+                                    if idx + 1 < nb_for_move_next.n_pages() {
+                                        nb_for_move_next.reorder_child(&root, Some(idx + 1));
+                                        nb_for_move_next.set_current_page(Some(idx + 1));
+                                        if let Some(target) = split::find_focused_terminal(&root) {
+                                            target.grab_focus();
+                                        }
                                     }
                                 }
                             }
@@ -816,20 +861,24 @@ fn main() {
 
                         // 5. Copiar Caminho do Diretório
                         let copy_path_btn = create_menu_item("Copiar Caminho do Diretório", "edit-copy-symbolic");
-                        let pop_copy = popover.clone();
+                        let pop_copy = popover.downgrade();
                         let nb_for_copy = notebook.clone();
-                        let tab_box_for_copy = tab_box.clone();
+                        let tab_box_for_copy = tab_box.downgrade();
                         let active_term_for_copy = active_terminal_for_tab.clone();
                         copy_path_btn.connect_clicked(move |_| {
-                            pop_copy.popdown();
-                            if let Some((_, root)) = split::find_page_by_tab_label(&nb_for_copy, &tab_box_for_copy.clone().upcast()) {
-                                let active_opt = active_term_for_copy.try_borrow().ok().and_then(|g| g.clone());
-                                if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
-                                    if let Some(cwd) = target.current_working_dir() {
-                                        if let Some(display) = gtk4::gdk::Display::default() {
-                                            let path_str = cwd.to_string_lossy().to_string();
-                                            display.clipboard().set_text(&path_str);
-                                            display.primary_clipboard().set_text(&path_str);
+                            if let Some(pop) = pop_copy.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_copy.upgrade() {
+                                if let Some((_, root)) = split::find_page_by_tab_label(&nb_for_copy, &tb.upcast()) {
+                                    let active_opt = active_term_for_copy.try_borrow().ok().and_then(|g| g.clone());
+                                    if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
+                                        if let Some(cwd) = target.current_working_dir() {
+                                            if let Some(display) = gtk4::gdk::Display::default() {
+                                                let path_str = cwd.to_string_lossy().to_string();
+                                                display.clipboard().set_text(&path_str);
+                                                display.primary_clipboard().set_text(&path_str);
+                                            }
                                         }
                                     }
                                 }
@@ -842,52 +891,64 @@ fn main() {
 
                         // Dividir à Direita
                         let split_r_btn = create_menu_item("Dividir à Direita", "view-split-left-right-symbolic");
-                        let pop_split_r = popover.clone();
+                        let pop_split_r = popover.downgrade();
                         let do_split_tab_r = do_split_cb.clone();
                         let nb_tab_split_r = notebook.clone();
                         let win_tab_split_r = window.clone();
-                        let tab_box_for_split_r = tab_box.clone();
+                        let tab_box_for_split_r = tab_box.downgrade();
                         let active_term_split_r = active_terminal_for_tab.clone();
                         split_r_btn.connect_clicked(move |_| {
-                            pop_split_r.popdown();
-                            if let Some((_, root)) = split::find_page_by_tab_label(&nb_tab_split_r, &tab_box_for_split_r.clone().upcast()) {
-                                let active_opt = active_term_split_r.try_borrow().ok().and_then(|g| g.clone());
-                                let target = split::find_focused_terminal_with_active(&root, active_opt.as_ref());
-                                do_split_tab_r(&nb_tab_split_r, &win_tab_split_r, target.as_ref(), gtk4::Orientation::Horizontal);
+                            if let Some(pop) = pop_split_r.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_split_r.upgrade() {
+                                if let Some((_, root)) = split::find_page_by_tab_label(&nb_tab_split_r, &tb.upcast()) {
+                                    let active_opt = active_term_split_r.try_borrow().ok().and_then(|g| g.clone());
+                                    let target = split::find_focused_terminal_with_active(&root, active_opt.as_ref());
+                                    do_split_tab_r(&nb_tab_split_r, &win_tab_split_r, target.as_ref(), gtk4::Orientation::Horizontal);
+                                }
                             }
                         });
                         menu_box.append(&split_r_btn);
 
                         // Dividir Abaixo
                         let split_d_btn = create_menu_item("Dividir Abaixo", "view-split-top-bottom-symbolic");
-                        let pop_split_d = popover.clone();
+                        let pop_split_d = popover.downgrade();
                         let do_split_tab_d = do_split_cb.clone();
                         let nb_tab_split_d = notebook.clone();
                         let win_tab_split_d = window.clone();
-                        let tab_box_for_split_d = tab_box.clone();
+                        let tab_box_for_split_d = tab_box.downgrade();
                         let active_term_split_d = active_terminal_for_tab.clone();
                         split_d_btn.connect_clicked(move |_| {
-                            pop_split_d.popdown();
-                            if let Some((_, root)) = split::find_page_by_tab_label(&nb_tab_split_d, &tab_box_for_split_d.clone().upcast()) {
-                                let active_opt = active_term_split_d.try_borrow().ok().and_then(|g| g.clone());
-                                let target = split::find_focused_terminal_with_active(&root, active_opt.as_ref());
-                                do_split_tab_d(&nb_tab_split_d, &win_tab_split_d, target.as_ref(), gtk4::Orientation::Vertical);
+                            if let Some(pop) = pop_split_d.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_split_d.upgrade() {
+                                if let Some((_, root)) = split::find_page_by_tab_label(&nb_tab_split_d, &tb.upcast()) {
+                                    let active_opt = active_term_split_d.try_borrow().ok().and_then(|g| g.clone());
+                                    let target = split::find_focused_terminal_with_active(&root, active_opt.as_ref());
+                                    do_split_tab_d(&nb_tab_split_d, &win_tab_split_d, target.as_ref(), gtk4::Orientation::Vertical);
+                                }
                             }
                         });
                         menu_box.append(&split_d_btn);
 
                         // Desfazer Divisão
                         let unsplit_btn = create_menu_item("Desfazer Divisão", "view-restore-symbolic");
-                        let pop_unsplit = popover.clone();
+                        let pop_unsplit = popover.downgrade();
                         let nb_unsplit = notebook.clone();
-                        let tab_box_for_unsplit = tab_box.clone();
+                        let tab_box_for_unsplit = tab_box.downgrade();
                         let active_term_unsplit = active_terminal_for_tab.clone();
                         unsplit_btn.connect_clicked(move |_| {
-                            pop_unsplit.popdown();
-                            if let Some((_, root)) = split::find_page_by_tab_label(&nb_unsplit, &tab_box_for_unsplit.clone().upcast()) {
-                                let active_opt = active_term_unsplit.try_borrow().ok().and_then(|g| g.clone());
-                                if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
-                                    split::unsplit_terminal(&target, &nb_unsplit);
+                            if let Some(pop) = pop_unsplit.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_unsplit.upgrade() {
+                                if let Some((_, root)) = split::find_page_by_tab_label(&nb_unsplit, &tb.upcast()) {
+                                    let active_opt = active_term_unsplit.try_borrow().ok().and_then(|g| g.clone());
+                                    if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
+                                        split::unsplit_terminal(&target, &nb_unsplit);
+                                    }
                                 }
                             }
                         });
@@ -895,18 +956,22 @@ fn main() {
 
                         // Fechar Painel Ativo
                         let close_pane_btn = create_menu_item("Fechar Painel Ativo", "window-close-symbolic");
-                        let pop_close_pane = popover.clone();
+                        let pop_close_pane = popover.downgrade();
                         let nb_close_p = notebook.clone();
                         let win_close_p = window.clone();
                         let cfg_close_p = cfg_for_tab.clone();
-                        let tab_box_for_close_p = tab_box.clone();
+                        let tab_box_for_close_p = tab_box.downgrade();
                         let active_term_close_p = active_terminal_for_tab.clone();
                         close_pane_btn.connect_clicked(move |_| {
-                            pop_close_pane.popdown();
-                            if let Some((_, root)) = split::find_page_by_tab_label(&nb_close_p, &tab_box_for_close_p.clone().upcast()) {
-                                let active_opt = active_term_close_p.try_borrow().ok().and_then(|g| g.clone());
-                                if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
-                                    close_pane_or_tab(&nb_close_p, &win_close_p, &cfg_close_p, &active_term_close_p, &target);
+                            if let Some(pop) = pop_close_pane.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_close_p.upgrade() {
+                                if let Some((_, root)) = split::find_page_by_tab_label(&nb_close_p, &tb.upcast()) {
+                                    let active_opt = active_term_close_p.try_borrow().ok().and_then(|g| g.clone());
+                                    if let Some(target) = split::find_focused_terminal_with_active(&root, active_opt.as_ref()) {
+                                        close_pane_or_tab(&nb_close_p, &win_close_p, &cfg_close_p, &active_term_close_p, &target);
+                                    }
                                 }
                             }
                         });
@@ -914,14 +979,18 @@ fn main() {
 
                         // Mesclar com Aba Anterior ao Lado
                         let merge_p_btn = create_menu_item("Mesclar com Aba Anterior", "insert-object-symbolic");
-                        let pop_merge_p = popover.clone();
+                        let pop_merge_p = popover.downgrade();
                         let nb_merge_p = notebook.clone();
-                        let tab_box_for_merge_p = tab_box.clone();
+                        let tab_box_for_merge_p = tab_box.downgrade();
                         merge_p_btn.connect_clicked(move |_| {
-                            pop_merge_p.popdown();
-                            if let Some((idx, _)) = split::find_page_by_tab_label(&nb_merge_p, &tab_box_for_merge_p.clone().upcast()) {
-                                if idx > 0 {
-                                    split::merge_tabs(idx - 1, idx, gtk4::Orientation::Horizontal, &nb_merge_p);
+                            if let Some(pop) = pop_merge_p.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_merge_p.upgrade() {
+                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_merge_p, &tb.upcast()) {
+                                    if idx > 0 {
+                                        split::merge_tabs(idx - 1, idx, gtk4::Orientation::Horizontal, &nb_merge_p);
+                                    }
                                 }
                             }
                         });
@@ -929,14 +998,18 @@ fn main() {
 
                         // Mesclar com Próxima Aba ao Lado
                         let merge_n_btn = create_menu_item("Mesclar com Próxima Aba", "insert-object-symbolic");
-                        let pop_merge_n = popover.clone();
+                        let pop_merge_n = popover.downgrade();
                         let nb_merge_n = notebook.clone();
-                        let tab_box_for_merge_n = tab_box.clone();
+                        let tab_box_for_merge_n = tab_box.downgrade();
                         merge_n_btn.connect_clicked(move |_| {
-                            pop_merge_n.popdown();
-                            if let Some((idx, _)) = split::find_page_by_tab_label(&nb_merge_n, &tab_box_for_merge_n.clone().upcast()) {
-                                if idx + 1 < nb_merge_n.n_pages() {
-                                    split::merge_tabs(idx + 1, idx, gtk4::Orientation::Horizontal, &nb_merge_n);
+                            if let Some(pop) = pop_merge_n.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_merge_n.upgrade() {
+                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_merge_n, &tb.upcast()) {
+                                    if idx + 1 < nb_merge_n.n_pages() {
+                                        split::merge_tabs(idx + 1, idx, gtk4::Orientation::Horizontal, &nb_merge_n);
+                                    }
                                 }
                             }
                         });
@@ -947,38 +1020,46 @@ fn main() {
 
                         // 6. Fechar Aba
                         let close_btn = create_menu_item("Fechar Aba", "window-close-symbolic");
-                        let pop_close = popover.clone();
+                        let pop_close = popover.downgrade();
                         let nb_for_close_btn = notebook.clone();
                         let win_for_close_btn = window.clone();
                         let cfg_for_close_btn = cfg_for_tab.clone();
-                        let tab_box_for_close_btn = tab_box.clone();
+                        let tab_box_for_close_btn = tab_box.downgrade();
                         let active_term_for_close_btn = active_terminal_for_tab.clone();
                         close_btn.connect_clicked(move |_| {
-                            pop_close.popdown();
-                            if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_close_btn, &tab_box_for_close_btn.clone().upcast()) {
-                                close_tab_page(
-                                    &nb_for_close_btn,
-                                    &win_for_close_btn,
-                                    &cfg_for_close_btn,
-                                    &active_term_for_close_btn,
-                                    idx,
-                                );
+                            if let Some(pop) = pop_close.upgrade() {
+                                pop.popdown();
+                            }
+                            if let Some(tb) = tab_box_for_close_btn.upgrade() {
+                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_close_btn, &tb.upcast()) {
+                                    close_tab_page(
+                                        &nb_for_close_btn,
+                                        &win_for_close_btn,
+                                        &cfg_for_close_btn,
+                                        &active_term_for_close_btn,
+                                        idx,
+                                    );
+                                }
                             }
                         });
                         menu_box.append(&close_btn);
 
                         // 7. Fechar Outras Abas
                         let close_others_btn = create_menu_item("Fechar Outras Abas", "edit-clear-symbolic");
-                        let pop_close_others = popover.clone();
+                        let pop_close_others = popover.downgrade();
                         let nb_for_close_others = notebook.clone();
-                        let tab_box_for_close_others = tab_box.clone();
+                        let tab_box_for_close_others = tab_box.downgrade();
                         let active_term_close_others = active_terminal_for_tab.clone();
                         close_others_btn.connect_clicked(move |_| {
-                            pop_close_others.popdown();
+                            if let Some(pop) = pop_close_others.upgrade() {
+                                pop.popdown();
+                            }
+                            let Some(tb) = tab_box_for_close_others.upgrade() else { return };
+                            let tb_widget: gtk4::Widget = tb.upcast();
                             let mut i = 0;
                             while i < nb_for_close_others.n_pages() {
                                 if let Some(page) = nb_for_close_others.nth_page(Some(i)) {
-                                    let is_this = nb_for_close_others.tab_label(&page).as_ref() == Some(&tab_box_for_close_others.clone().upcast());
+                                    let is_this = nb_for_close_others.tab_label(&page).as_ref() == Some(&tb_widget);
                                     if is_this {
                                         i += 1;
                                     } else {
@@ -986,11 +1067,15 @@ fn main() {
                                         for t in terminals {
                                             t.terminate();
                                         }
+                                        split::cleanup_tab_label(&nb_for_close_others, &page);
                                         nb_for_close_others.remove_page(Some(i));
                                     }
                                 } else {
                                     break;
                                 }
+                            }
+                            unsafe {
+                                libc::malloc_trim(0);
                             }
                             if let Some(cur) = nb_for_close_others.current_page() {
                                 if let Some(page) = nb_for_close_others.nth_page(Some(cur)) {
@@ -1011,35 +1096,41 @@ fn main() {
                         // Right Click gesture to open Popover
                         let tab_right_click = gtk4::GestureClick::new();
                         tab_right_click.set_button(gtk4::gdk::BUTTON_SECONDARY);
-                        let pop_trigger = popover.clone();
+                        let pop_trigger = popover.downgrade();
                         let nb_for_right_click = notebook.clone();
-                        let tab_box_for_right_click = tab_box.clone();
-                        let view_for_right_click = view.clone();
-                        let btn_p = move_prev_btn.clone();
-                        let btn_n = move_next_btn.clone();
-                        let btn_merge_p = merge_p_btn.clone();
-                        let btn_merge_n = merge_n_btn.clone();
-                        let btn_split_r = split_r_btn.clone();
-                        let btn_split_d = split_d_btn.clone();
-                        let btn_unsplit = unsplit_btn.clone();
-                        let btn_close_pane = close_pane_btn.clone();
-                        let btn_restore = restore_name_btn.clone();
+                        let tab_box_for_right_click = tab_box.downgrade();
+                        let view_for_right_click = view.downgrade();
+                        let btn_p = move_prev_btn.downgrade();
+                        let btn_n = move_next_btn.downgrade();
+                        let btn_merge_p = merge_p_btn.downgrade();
+                        let btn_merge_n = merge_n_btn.downgrade();
+                        let btn_split_r = split_r_btn.downgrade();
+                        let btn_split_d = split_d_btn.downgrade();
+                        let btn_unsplit = unsplit_btn.downgrade();
+                        let btn_close_pane = close_pane_btn.downgrade();
+                        let btn_restore = restore_name_btn.downgrade();
                         tab_right_click.connect_pressed(move |gesture, _, _, _| {
                             gesture.set_state(gtk4::EventSequenceState::Claimed);
-                            if let Some((idx, root)) = split::find_page_by_tab_label(&nb_for_right_click, &tab_box_for_right_click.clone().upcast()) {
-                                btn_p.set_sensitive(idx > 0);
-                                btn_n.set_sensitive(idx + 1 < nb_for_right_click.n_pages());
-                                btn_merge_p.set_sensitive(idx > 0);
-                                btn_merge_n.set_sensitive(idx + 1 < nb_for_right_click.n_pages());
-                                let count = split::find_terminals(&root).len();
-                                btn_split_r.set_sensitive(count < split::MAX_PANES_PER_TAB);
-                                btn_split_d.set_sensitive(count < split::MAX_PANES_PER_TAB);
-                                btn_unsplit.set_sensitive(count > 1);
-                                btn_close_pane.set_sensitive(count > 1);
+                            if let Some(tb) = tab_box_for_right_click.upgrade() {
+                                if let Some((idx, root)) = split::find_page_by_tab_label(&nb_for_right_click, &tb.upcast()) {
+                                    if let Some(b) = btn_p.upgrade() { b.set_sensitive(idx > 0); }
+                                    if let Some(b) = btn_n.upgrade() { b.set_sensitive(idx + 1 < nb_for_right_click.n_pages()); }
+                                    if let Some(b) = btn_merge_p.upgrade() { b.set_sensitive(idx > 0); }
+                                    if let Some(b) = btn_merge_n.upgrade() { b.set_sensitive(idx + 1 < nb_for_right_click.n_pages()); }
+                                    let count = split::find_terminals(&root).len();
+                                    if let Some(b) = btn_split_r.upgrade() { b.set_sensitive(count < split::MAX_PANES_PER_TAB); }
+                                    if let Some(b) = btn_split_d.upgrade() { b.set_sensitive(count < split::MAX_PANES_PER_TAB); }
+                                    if let Some(b) = btn_unsplit.upgrade() { b.set_sensitive(count > 1); }
+                                    if let Some(b) = btn_close_pane.upgrade() { b.set_sensitive(count > 1); }
+                                }
                             }
-                            let is_custom = view_for_right_click.custom_title().is_some();
-                            btn_restore.set_sensitive(is_custom);
-                            pop_trigger.popup();
+                            if let (Some(v), Some(b)) = (view_for_right_click.upgrade(), btn_restore.upgrade()) {
+                                let is_custom = v.custom_title().is_some();
+                                b.set_sensitive(is_custom);
+                            }
+                            if let Some(pop) = pop_trigger.upgrade() {
+                                pop.popup();
+                            }
                         });
                         tab_box.add_controller(tab_right_click);
 
@@ -1049,7 +1140,7 @@ fn main() {
                         let nb_for_tab_click = notebook.clone();
                         let win_for_tab_click = window.clone();
                         let cfg_for_tab_click = cfg_for_tab.clone();
-                        let tab_box_for_tab_click = tab_box.clone();
+                        let tab_box_for_tab_click = tab_box.downgrade();
                         let active_term_tab_click = active_terminal_for_tab.clone();
                         let start_rename_for_click = start_rename.clone();
                         tab_left_click.connect_pressed(move |gesture, n_press, _x, _y| {
@@ -1060,8 +1151,10 @@ fn main() {
                                 return;
                             }
 
+                            let Some(tb) = tab_box_for_tab_click.upgrade() else { return };
+                            let tb_widget: gtk4::Widget = tb.upcast();
                             if n_press == 1 {
-                                if let Some((page_idx, page)) = split::find_page_by_tab_label(&nb_for_tab_click, &tab_box_for_tab_click.clone().upcast()) {
+                                if let Some((page_idx, page)) = split::find_page_by_tab_label(&nb_for_tab_click, &tb_widget) {
                                     nb_for_tab_click.set_current_page(Some(page_idx));
                                     let active_opt = active_term_tab_click.try_borrow().ok().and_then(|g| g.clone());
                                     if let Some(target) = split::find_focused_terminal_with_active(&page, active_opt.as_ref()) {
@@ -1073,7 +1166,7 @@ fn main() {
                                     return;
                                 }
                                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_tab_click, &tab_box_for_tab_click.clone().upcast()) {
+                                if let Some((idx, _)) = split::find_page_by_tab_label(&nb_for_tab_click, &tb_widget) {
                                     close_tab_page(
                                         &nb_for_tab_click,
                                         &win_for_tab_click,
@@ -1122,13 +1215,16 @@ fn main() {
                         );
 
                         // Auto-update tab title to current working dir when not custom titled
-                        let label_for_auto = label.clone();
+                        let label_for_auto = label.downgrade();
                         let nb_for_auto = notebook.clone();
                         let last_seen_for_auto = last_seen_cwd.clone();
-                        let tab_box_for_auto = tab_box.clone();
+                        let tab_box_for_auto = tab_box.downgrade();
                         let active_terminal_for_auto = active_terminal_for_tab.clone();
                         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                            let (_, page) = match split::find_page_by_tab_label(&nb_for_auto, &tab_box_for_auto.clone().upcast()) {
+                            let (Some(tb), Some(label_for_auto)) = (tab_box_for_auto.upgrade(), label_for_auto.upgrade()) else {
+                                return glib::ControlFlow::Break;
+                            };
+                            let (_, page) = match split::find_page_by_tab_label(&nb_for_auto, &tb.upcast()) {
                                 Some(res) => res,
                                 None => return glib::ControlFlow::Break,
                             };
@@ -1381,6 +1477,7 @@ fn main() {
                     for tv in terminals {
                         tv.terminate();
                     }
+                    split::cleanup_tab_label(&nb_for_close, &page);
                 }
             }
             if !tabs_to_save.is_empty() {

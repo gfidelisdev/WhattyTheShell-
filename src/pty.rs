@@ -114,6 +114,40 @@ impl Pty {
         None
     }
 
+    /// Raw file descriptor of the PTY master.
+    pub fn raw_fd(&self) -> RawFd {
+        self.master.as_raw_fd()
+    }
+
+    /// Non-blocking read from the PTY master using `poll(..., 0)`.
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let fd = self.master.as_raw_fd();
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_res = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if poll_res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if poll_res == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        if (pfd.revents & libc::POLLIN) != 0 {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        } else if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+            Ok(0)
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
     /// A readable handle to the master side (blocking reads; use from a thread).
     pub fn reader(&self) -> io::Result<File> {
         Ok(File::from(self.master.try_clone()?))

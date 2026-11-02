@@ -292,6 +292,227 @@ fn fs_glyph(in: GlyphVertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+struct SharedPipelineState {
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+    bg_pipeline: wgpu::RenderPipeline,
+    glyph_pipeline: wgpu::RenderPipeline,
+    bg_buffer: wgpu::Buffer,
+    glyph_buffer: wgpu::Buffer,
+    atlas_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+fn get_or_create_shared_pipeline(
+    device: &wgpu::Device,
+    max_cells: usize,
+) -> std::sync::Arc<SharedPipelineState> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<(ash::vk::Device, Arc<SharedPipelineState>)>>> = OnceLock::new();
+    let vk_dev = unsafe {
+        device
+            .as_hal::<wgpu::hal::api::Vulkan>()
+            .map(|d| d.raw_device().handle())
+    };
+    let mutex = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().unwrap();
+    if let (Some(vk_dev), Some((cached_dev, ref state))) = (vk_dev, guard.as_ref()) {
+        if *cached_dev == vk_dev {
+            return state.clone();
+        }
+    }
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("terminal_shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
+    });
+
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("terminal_uniform_buffer"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let uniform_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("uniform_bind_group_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+    let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("uniform_bind_group"),
+        layout: &uniform_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let atlas_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("atlas_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+    let bg_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bg_pipeline_layout"),
+        bind_group_layouts: &[Some(&uniform_bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let bg_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<BgInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+
+    let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("bg_pipeline"),
+        layout: Some(&bg_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_bg"),
+            buffers: &[Some(bg_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_bg"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let glyph_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("glyph_pipeline_layout"),
+            bind_group_layouts: &[Some(&uniform_bind_group_layout), Some(&atlas_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+    let glyph_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GlyphInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+
+    let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("glyph_pipeline"),
+        layout: Some(&glyph_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_glyph"),
+            buffers: &[Some(glyph_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_glyph"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let bg_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bg_instance_buffer"),
+        size: (max_cells * std::mem::size_of::<BgInstance>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let glyph_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("glyph_instance_buffer"),
+        size: (max_cells * std::mem::size_of::<GlyphInstance>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let shared = Arc::new(SharedPipelineState {
+        uniform_buffer,
+        uniform_bind_group,
+        bg_pipeline,
+        glyph_pipeline,
+        bg_buffer,
+        glyph_buffer,
+        atlas_bind_group_layout,
+    });
+    if let Some(vk_dev) = vk_dev {
+        *guard = Some((vk_dev, shared.clone()));
+    }
+    shared
+}
+
 impl TerminalRenderer {
     pub fn new(
         device: &wgpu::Device,
@@ -300,69 +521,12 @@ impl TerminalRenderer {
         font_size: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let atlas = GlyphAtlas::new(device, queue, font_family, font_size)?;
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terminal_shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
-        });
-
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("terminal_uniform_buffer"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("uniform_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniform_bind_group"),
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let atlas_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("atlas_bind_group_layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        let max_cells = 256 * 100;
+        let shared = get_or_create_shared_pipeline(device, max_cells);
 
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas_bind_group"),
-            layout: &atlas_bind_group_layout,
+            layout: &shared.atlas_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -375,135 +539,16 @@ impl TerminalRenderer {
             ],
         });
 
-        let bg_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bg_pipeline_layout"),
-            bind_group_layouts: &[Some(&uniform_bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let bg_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<BgInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: 16,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        };
-
-        let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bg_pipeline"),
-            layout: Some(&bg_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_bg"),
-                buffers: &[Some(bg_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_bg"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let glyph_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("glyph_pipeline_layout"),
-                bind_group_layouts: &[Some(&uniform_bind_group_layout), Some(&atlas_bind_group_layout)],
-                immediate_size: 0,
-            });
-
-        let glyph_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<GlyphInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: 16,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: 32,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        };
-
-        let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glyph_pipeline"),
-            layout: Some(&glyph_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_glyph"),
-                buffers: &[Some(glyph_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_glyph"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let max_cells = 256 * 100;
-        let bg_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bg_instance_buffer"),
-            size: (max_cells * std::mem::size_of::<BgInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let glyph_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("glyph_instance_buffer"),
-            size: (max_cells * std::mem::size_of::<GlyphInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Ok(TerminalRenderer {
             atlas,
-            uniform_buffer,
-            uniform_bind_group,
-            bg_pipeline,
-            glyph_pipeline,
-            bg_buffer,
-            glyph_buffer,
+            uniform_buffer: shared.uniform_buffer.clone(),
+            uniform_bind_group: shared.uniform_bind_group.clone(),
+            bg_pipeline: shared.bg_pipeline.clone(),
+            glyph_pipeline: shared.glyph_pipeline.clone(),
+            bg_buffer: shared.bg_buffer.clone(),
+            glyph_buffer: shared.glyph_buffer.clone(),
             atlas_bind_group,
-            atlas_bind_group_layout,
+            atlas_bind_group_layout: shared.atlas_bind_group_layout.clone(),
             palette: Palette::default(),
             saturation_boost: 1.0,
             max_cells,
@@ -888,10 +933,10 @@ mod tests {
             None,
         );
 
-        let tilde_info = renderer.atlas.cache.get(&('~', 0)).expect("tilde not cached");
+        let tilde_info = renderer.atlas.get_cached(&('~', 0)).expect("tilde not cached");
         assert!(tilde_info.size[0] > 0.0 && tilde_info.size[1] > 0.0, "tilde size is 0: {:?}", tilde_info);
 
-        let a_acute_info = renderer.atlas.cache.get(&('á', 0)).expect("á not cached");
+        let a_acute_info = renderer.atlas.get_cached(&('á', 0)).expect("á not cached");
         assert!(a_acute_info.size[0] > 0.0 && a_acute_info.size[1] > 0.0, "á size is 0: {:?}", a_acute_info);
 
         // Read back texture pixels to verify ~ is actually drawn with visible pixels

@@ -235,6 +235,12 @@ impl DmabufFrame {
     }
 }
 
+impl Drop for DmabufFrame {
+    fn drop(&mut self) {
+        self.texture.destroy();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

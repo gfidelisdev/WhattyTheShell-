@@ -287,6 +287,21 @@ pub fn unsplit_active_tab(
     unsplit_terminal(&view, notebook)
 }
 
+/// Unparents any `gtk4::Popover` children attached to the tab header label widget of `page`
+/// so the tab header `Box` and its popovers can finalize cleanly when the tab is closed.
+pub fn cleanup_tab_label(notebook: &gtk4::Notebook, page: &Widget) {
+    if let Some(tab_label) = notebook.tab_label(page) {
+        let mut child_opt = tab_label.first_child();
+        while let Some(child) = child_opt {
+            let next = child.next_sibling();
+            if child.downcast_ref::<gtk4::Popover>().is_some() {
+                child.unparent();
+            }
+            child_opt = next;
+        }
+    }
+}
+
 /// Merges `source_tab_idx` into `target_tab_idx` alongside `target_view` (or the focused terminal of `target_tab_idx`).
 /// Returns `true` if successful.
 pub fn merge_tabs(
@@ -318,7 +333,8 @@ pub fn merge_tabs(
 
     let target_view = find_focused_terminal(&target_page).unwrap_or_else(|| target_terminals[0].clone());
 
-    // Remove source page from notebook
+    // Unparent popovers on source tab label and remove source page from notebook
+    cleanup_tab_label(notebook, &source_page);
     notebook.remove_page(Some(source_tab_idx));
 
     // Now insert source_page into target_view's position

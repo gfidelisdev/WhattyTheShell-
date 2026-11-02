@@ -2,7 +2,7 @@
 //! Glyph rasterization and GPU texture atlas for monospace terminal cells.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
 use swash::FontRef;
@@ -17,13 +17,8 @@ pub struct GlyphInfo {
     pub size: [f32; 2],
 }
 
-pub struct GlyphAtlas {
+pub struct GlyphAtlasInner {
     pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
-    pub sampler: wgpu::Sampler,
-    pub cell_width: f32,
-    pub cell_height: f32,
-    pub ascent: f32,
 
     font_datas: Vec<(Arc<[u8]>, u32)>,
     bold_font_datas: Vec<(Arc<[u8]>, u32)>,
@@ -37,6 +32,23 @@ pub struct GlyphAtlas {
     row_height: u32,
 }
 
+impl Drop for GlyphAtlasInner {
+    fn drop(&mut self) {
+        self.texture.destroy();
+    }
+}
+
+#[derive(Clone)]
+pub struct GlyphAtlas {
+    pub view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub ascent: f32,
+    pub font_size: f32,
+    inner: Arc<Mutex<GlyphAtlasInner>>,
+}
+
 impl GlyphAtlas {
     pub fn new(
         device: &wgpu::Device,
@@ -44,6 +56,28 @@ impl GlyphAtlas {
         font_family: Option<&str>,
         font_size: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        type CacheKey = (Option<ash::vk::Device>, Option<String>, u32);
+        static ATLAS_CACHE: OnceLock<Mutex<Option<(CacheKey, GlyphAtlas)>>> = OnceLock::new();
+        let cache_mutex = ATLAS_CACHE.get_or_init(|| Mutex::new(None));
+        let vk_dev = unsafe {
+            device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .map(|d| d.raw_device().handle())
+        };
+        let key: CacheKey = (
+            vk_dev,
+            font_family.map(|s| s.trim().to_string()),
+            font_size.to_bits(),
+        );
+        if vk_dev.is_some() {
+            let guard = cache_mutex.lock().unwrap();
+            if let Some((ref k, ref atlas)) = *guard {
+                if *k == key {
+                    return Ok(atlas.clone());
+                }
+            }
+        }
+
         let db = crate::fonts::shared_font_db();
 
         let mut queries = Vec::new();
@@ -222,13 +256,8 @@ impl GlyphAtlas {
             ..Default::default()
         });
 
-        Ok(GlyphAtlas {
+        let inner = Arc::new(Mutex::new(GlyphAtlasInner {
             texture,
-            view,
-            sampler,
-            cell_width,
-            cell_height,
-            ascent,
             font_datas,
             bold_font_datas,
             font_size,
@@ -237,7 +266,29 @@ impl GlyphAtlas {
             cursor_x: 1,
             cursor_y: 1,
             row_height: 0,
-        })
+        }));
+
+        let atlas = GlyphAtlas {
+            view,
+            sampler,
+            cell_width,
+            cell_height,
+            ascent,
+            font_size,
+            inner,
+        };
+
+        if vk_dev.is_some() {
+            let mut guard = cache_mutex.lock().unwrap();
+            *guard = Some((key, atlas.clone()));
+        }
+
+        Ok(atlas)
+    }
+
+    #[cfg(test)]
+    pub fn get_cached(&self, key: &(char, u8)) -> Option<GlyphInfo> {
+        self.inner.lock().unwrap().cache.get(key).copied()
     }
 
     pub fn get_or_insert(
@@ -246,7 +297,9 @@ impl GlyphAtlas {
         c: char,
         flags: u8,
     ) -> GlyphInfo {
-        if let Some(info) = self.cache.get(&(c, flags)) {
+        let mut inner_guard = self.inner.lock().unwrap();
+        let inner = &mut *inner_guard;
+        if let Some(info) = inner.cache.get(&(c, flags)) {
             return *info;
         }
 
@@ -254,10 +307,10 @@ impl GlyphAtlas {
         let mut best_font_ref = None;
         let mut best_glyph_id = 0;
 
-        let font_lists: [&Vec<(Arc<[u8]>, u32)>; 2] = if is_bold && !self.bold_font_datas.is_empty() {
-            [&self.bold_font_datas, &self.font_datas]
+        let font_lists: [&Vec<(Arc<[u8]>, u32)>; 2] = if is_bold && !inner.bold_font_datas.is_empty() {
+            [&inner.bold_font_datas, &inner.font_datas]
         } else {
-            [&self.font_datas, &self.bold_font_datas]
+            [&inner.font_datas, &inner.bold_font_datas]
         };
 
         for list in font_lists {
@@ -281,10 +334,11 @@ impl GlyphAtlas {
             None => return GlyphInfo::default(), // Character not found in any fallback
         };
 
-        let mut scaler = self
+        let font_size = inner.font_size;
+        let mut scaler = inner
             .scale_context
             .builder(font_ref)
-            .size(self.font_size)
+            .size(font_size)
             .hint(true)
             .build();
 
@@ -302,26 +356,26 @@ impl GlyphAtlas {
                 let h = img.placement.height;
 
                 // Check shelf fit
-                if self.cursor_x + w + 1 >= ATLAS_SIZE {
-                    self.cursor_x = 1;
-                    self.cursor_y += self.row_height + 1;
-                    self.row_height = 0;
+                if inner.cursor_x + w + 1 >= ATLAS_SIZE {
+                    inner.cursor_x = 1;
+                    inner.cursor_y += inner.row_height + 1;
+                    inner.row_height = 0;
                 }
 
-                if self.cursor_y + h + 1 >= ATLAS_SIZE {
+                if inner.cursor_y + h + 1 >= ATLAS_SIZE {
                     // Atlas full: evict cached glyph placements and restart allocation from the top
-                    self.cache.clear();
-                    self.cursor_x = 1;
-                    self.cursor_y = 1;
-                    self.row_height = 0;
+                    inner.cache.clear();
+                    inner.cursor_x = 1;
+                    inner.cursor_y = 1;
+                    inner.row_height = 0;
                 }
 
-                let x = self.cursor_x;
-                let y = self.cursor_y;
+                let x = inner.cursor_x;
+                let y = inner.cursor_y;
 
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &self.texture,
+                        texture: &inner.texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d { x, y, z: 0 },
                         aspect: wgpu::TextureAspect::All,
@@ -339,8 +393,8 @@ impl GlyphAtlas {
                     },
                 );
 
-                self.cursor_x += w + 1;
-                self.row_height = self.row_height.max(h);
+                inner.cursor_x += w + 1;
+                inner.row_height = inner.row_height.max(h);
 
                 GlyphInfo {
                     uv_min: [x as f32 / ATLAS_SIZE as f32, y as f32 / ATLAS_SIZE as f32],
@@ -355,7 +409,7 @@ impl GlyphAtlas {
             _ => GlyphInfo::default(),
         };
 
-        self.cache.insert((c, flags), info);
+        inner.cache.insert((c, flags), info);
         info
     }
 }
