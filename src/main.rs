@@ -358,6 +358,11 @@ fn main() {
                         }]);
                     }
                 }
+
+                // Terminate all terminals on this page to release PTY, child process, and GPU resources
+                for tv in terminals {
+                    tv.terminate();
+                }
             }
 
             notebook.remove_page(Some(page_idx));
@@ -472,13 +477,12 @@ fn main() {
                     let nb_close = notebook.clone();
                     let win_close = window.clone();
                     let cfg_exit = cfg_clone.clone();
-                    let v_exit = new_view.clone();
                     let active_term_on_exit = active_terminal_split.clone();
                     new_view.connect_closure(
                         "child-exited",
                         false,
-                        gtk4::glib::closure_local!(move |_v: TerminalView| {
-                            close_pane_or_tab(&nb_close, &win_close, &cfg_exit, &active_term_on_exit, &v_exit);
+                        gtk4::glib::closure_local!(move |v: TerminalView| {
+                            close_pane_or_tab(&nb_close, &win_close, &cfg_exit, &active_term_on_exit, &v);
                         }),
                     );
 
@@ -978,6 +982,10 @@ fn main() {
                                     if is_this {
                                         i += 1;
                                     } else {
+                                        let terminals = split::find_terminals(&page);
+                                        for t in terminals {
+                                            t.terminate();
+                                        }
                                         nb_for_close_others.remove_page(Some(i));
                                     }
                                 } else {
@@ -1104,13 +1112,12 @@ fn main() {
                         let nb_clone = notebook.clone();
                         let win_clone = window.clone();
                         let cfg_for_exit = cfg_for_tab.clone();
-                        let v_clone = view.clone();
                         let active_term_exit = active_terminal_for_tab.clone();
                         view.connect_closure(
                             "child-exited",
                             false,
-                            gtk4::glib::closure_local!(move |_v: TerminalView| {
-                                close_pane_or_tab(&nb_clone, &win_clone, &cfg_for_exit, &active_term_exit, &v_clone);
+                            gtk4::glib::closure_local!(move |v: TerminalView| {
+                                close_pane_or_tab(&nb_clone, &win_clone, &cfg_for_exit, &active_term_exit, &v);
                             }),
                         );
 
@@ -1370,6 +1377,9 @@ fn main() {
                             working_dir: cwd,
                             custom_title: is_custom,
                         });
+                    }
+                    for tv in terminals {
+                        tv.terminate();
                     }
                 }
             }

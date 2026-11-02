@@ -658,23 +658,52 @@ impl TerminalRenderer {
                         rect: [x, y, cell_w, cell_h],
                         color: sel_color,
                     });
+                } else if is_link {
+                    // Subtle hover tint for link cells
+                    bg_instances.push(BgInstance {
+                        rect: [x, y, cell_w, cell_h],
+                        color: [0.2, 0.6, 1.0, 0.18],
+                    });
+                }
+
+                // Underline (ANSI flag or hovered link)
+                let has_underline = (cell.flags & flags::UNDERLINE) != 0 || is_link;
+                if has_underline {
+                    let line_h = (cell_h * 0.08).clamp(1.5, 3.0);
+                    let line_y = (y + ascent + 1.5).min(y + cell_h - line_h);
+                    let underline_color = if is_link {
+                        [0.35, 0.8, 1.0, 1.0] // Vibrant cyan link underline
+                    } else {
+                        fg_color
+                    };
+                    bg_instances.push(BgInstance {
+                        rect: [x, line_y, cell_w, line_h],
+                        color: underline_color,
+                    });
                 }
 
                 // Glyph
                 if cell.c != ' ' && cell.c != '\0' && (cell.flags & flags::WIDE_SPACER) == 0 {
-                    let mut cell_flags = cell.flags;
-                    if is_link {
-                        cell_flags |= flags::UNDERLINE;
-                    }
-                    let info = self.atlas.get_or_insert(queue, cell.c, cell_flags);
+                    let info = self.atlas.get_or_insert(queue, cell.c, cell.flags);
                     if info.size[0] > 0.0 && info.size[1] > 0.0 {
                         let glyph_x = x + info.offset[0];
                         let glyph_y = y + (ascent - info.offset[1]);
 
+                        let glyph_color = if is_link {
+                            [
+                                (fg_color[0] * 0.8 + 0.35 * 0.2).min(1.0),
+                                (fg_color[1] * 0.8 + 0.85 * 0.2).min(1.0),
+                                (fg_color[2] * 0.8 + 1.0 * 0.2).min(1.0),
+                                fg_color[3],
+                            ]
+                        } else {
+                            fg_color
+                        };
+
                         glyph_instances.push(GlyphInstance {
                             rect: [glyph_x, glyph_y, info.size[0], info.size[1]],
                             uv: [info.uv_min[0], info.uv_min[1], info.uv_max[0], info.uv_max[1]],
-                            color: fg_color,
+                            color: glyph_color,
                         });
                     }
                 }

@@ -135,12 +135,29 @@ impl Pty {
         cvt(unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) })?;
         Ok(())
     }
+
+    /// The PID of the child process running on this PTY.
+    pub fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Gracefully terminate the process group and child process attached to this PTY.
+    pub fn terminate(&mut self) {
+        let pid = self.child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGHUP);
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate();
     }
 }
 

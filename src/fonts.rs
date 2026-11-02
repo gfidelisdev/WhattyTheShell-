@@ -2,6 +2,7 @@
 //! System font discovery and fuzzy matching for terminal font selection.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontFamilyInfo {
@@ -9,10 +10,40 @@ pub struct FontFamilyInfo {
     pub is_monospaced: bool,
 }
 
+/// Shared, lazily initialized system font database to prevent re-scanning `/usr/share/fonts` per tab.
+pub fn shared_font_db() -> &'static fontdb::Database {
+    static DB: OnceLock<fontdb::Database> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
+static FONT_DATA_CACHE: OnceLock<Mutex<std::collections::HashMap<fontdb::ID, Arc<[u8]>>>> = OnceLock::new();
+
+/// Retrieves cached font face data as an `Arc<[u8]>` to share font memory across all tabs.
+pub fn get_cached_face_data(db: &fontdb::Database, id: fontdb::ID) -> Option<(Arc<[u8]>, u32)> {
+    let cache_mutex = FONT_DATA_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache_mutex.lock().unwrap();
+    if let Some(data) = cache.get(&id) {
+        let mut index = 0;
+        db.with_face_data(id, |_, idx| { index = idx; });
+        return Some((data.clone(), index));
+    }
+
+    let mut result = None;
+    db.with_face_data(id, |data, idx| {
+        let arc: Arc<[u8]> = Arc::from(data);
+        cache.insert(id, arc.clone());
+        result = Some((arc, idx));
+    });
+    result
+}
+
 /// Discovers all font families installed on the system using fontdb.
 pub fn query_system_fonts() -> Vec<FontFamilyInfo> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = shared_font_db();
 
     // Map family_name -> has_monospaced_face
     let mut families: BTreeMap<String, bool> = BTreeMap::new();

@@ -2,6 +2,7 @@
 //! Glyph rasterization and GPU texture atlas for monospace terminal cells.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
 use swash::FontRef;
@@ -24,8 +25,8 @@ pub struct GlyphAtlas {
     pub cell_height: f32,
     pub ascent: f32,
 
-    font_datas: Vec<(Vec<u8>, u32)>,
-    bold_font_datas: Vec<(Vec<u8>, u32)>,
+    font_datas: Vec<(Arc<[u8]>, u32)>,
+    bold_font_datas: Vec<(Arc<[u8]>, u32)>,
     pub font_size: f32,
 
     scale_context: ScaleContext,
@@ -43,8 +44,7 @@ impl GlyphAtlas {
         font_family: Option<&str>,
         font_size: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
+        let db = crate::fonts::shared_font_db();
 
         let mut queries = Vec::new();
         let mut bold_queries = Vec::new();
@@ -116,9 +116,9 @@ impl GlyphAtlas {
         for query in &queries {
             if let Some(face_id) = db.query(query) {
                 if seen.insert(face_id) {
-                    db.with_face_data(face_id, |data, index| {
-                        font_datas.push((data.to_vec(), index));
-                    });
+                    if let Some(face_data) = crate::fonts::get_cached_face_data(db, face_id) {
+                        font_datas.push(face_data);
+                    }
                 }
             }
         }
@@ -127,20 +127,44 @@ impl GlyphAtlas {
         for query in &bold_queries {
             if let Some(face_id) = db.query(query) {
                 if seen_bold.insert(face_id) {
-                    db.with_face_data(face_id, |data, index| {
-                        bold_font_datas.push((data.to_vec(), index));
-                    });
+                    if let Some(face_data) = crate::fonts::get_cached_face_data(db, face_id) {
+                        bold_font_datas.push(face_data);
+                    }
                 }
             }
         }
         
-        // Add all system faces as fallback for full Unicode / symbol coverage
+        // Add targeted symbol/emoji faces as fallback
+        let symbol_fams = [
+            fontdb::Family::Name("Noto Color Emoji"),
+            fontdb::Family::Name("Segoe UI Emoji"),
+            fontdb::Family::Name("Symbola"),
+            fontdb::Family::Name("Noto Sans CJK SC"),
+            fontdb::Family::Name("Noto Sans CJK JP"),
+            fontdb::Family::Name("WenQuanYi Micro Hei"),
+        ];
+        for fam in &symbol_fams {
+            let q = fontdb::Query {
+                families: &[*fam],
+                weight: fontdb::Weight::NORMAL,
+                ..fontdb::Query::default()
+            };
+            if let Some(face_id) = db.query(&q) {
+                if seen.insert(face_id) {
+                    if let Some(face_data) = crate::fonts::get_cached_face_data(db, face_id) {
+                        font_datas.push(face_data);
+                    }
+                }
+            }
+        }
+
+        // Add small number of system faces as general fallback
         for face in db.faces() {
             if seen.insert(face.id) {
-                db.with_face_data(face.id, |data, index| {
-                    font_datas.push((data.to_vec(), index));
-                });
-                if font_datas.len() >= 40 {
+                if let Some(face_data) = crate::fonts::get_cached_face_data(db, face.id) {
+                    font_datas.push(face_data);
+                }
+                if font_datas.len() >= 20 {
                     break;
                 }
             }
@@ -230,7 +254,7 @@ impl GlyphAtlas {
         let mut best_font_ref = None;
         let mut best_glyph_id = 0;
 
-        let font_lists: [&Vec<(Vec<u8>, u32)>; 2] = if is_bold && !self.bold_font_datas.is_empty() {
+        let font_lists: [&Vec<(Arc<[u8]>, u32)>; 2] = if is_bold && !self.bold_font_datas.is_empty() {
             [&self.bold_font_datas, &self.font_datas]
         } else {
             [&self.font_datas, &self.bold_font_datas]

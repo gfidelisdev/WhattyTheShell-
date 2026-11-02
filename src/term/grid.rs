@@ -286,7 +286,7 @@ impl Grid {
         self.url_at_with_offset(row, col, 0)
     }
 
-    /// Find a URL or hyperlink (HTTP/HTTPS/file or markdown link) at the specified cell taking `display_offset` into account.
+    /// Find a URL, file path, or markdown link at the specified cell taking `display_offset` into account.
     pub fn url_at_with_offset(
         &self,
         row: usize,
@@ -303,101 +303,408 @@ impl Grid {
             .map(|c| if c.c == '\0' { ' ' } else { c.c })
             .collect();
 
-        // 1. Detect Markdown links: [Label](URL) or [`Label`](URL)
-        let mut idx = 0;
-        while idx < line_chars.len() {
-            if line_chars[idx] == '[' {
-                let start_idx = idx;
-                let mut sep_idx = None;
-                let mut j = start_idx + 1;
-                while j < line_chars.len() {
-                    if line_chars[j] == '[' {
+        // 1. Check if row is part of a wrapped line
+        // A row wraps into next row if its last character is not space/null
+        let row_wraps = |r: usize| -> bool {
+            if let Some(r_cells) = self.visible_row(r, display_offset) {
+                if let Some(last) = r_cells.last() {
+                    return last.c != ' ' && last.c != '\0';
+                }
+            }
+            false
+        };
+
+        let start_row = if row > 0 && row_wraps(row - 1) {
+            if row >= 2 && row_wraps(row - 2) {
+                row - 2
+            } else {
+                row - 1
+            }
+        } else {
+            row
+        };
+
+        let end_row = if row_wraps(row) {
+            if row + 1 < self.rows && row_wraps(row + 1) {
+                (row + 2).min(self.rows - 1)
+            } else {
+                (row + 1).min(self.rows - 1)
+            }
+        } else {
+            row
+        };
+
+        if start_row < end_row {
+            let mut joined_chars = Vec::new();
+            for r in start_row..=end_row {
+                if let Some(r_cells) = self.visible_row(r, display_offset) {
+                    let mut r_chars: Vec<char> = r_cells
+                        .iter()
+                        .map(|c| if c.c == '\0' { ' ' } else { c.c })
+                        .collect();
+                    r_chars.resize(self.cols, ' ');
+                    joined_chars.extend(r_chars);
+                }
+            }
+
+            let joined_matches = find_links_in_chars(&joined_chars);
+            let offset_in_joined = (row - start_row) * self.cols + col;
+            for (target, s, e) in joined_matches {
+                if offset_in_joined >= s && offset_in_joined <= e {
+                    let s_row = start_row + s / self.cols;
+                    let s_col = s % self.cols;
+                    let e_row = start_row + e / self.cols;
+                    let e_col = e % self.cols;
+                    return Some((target, ((s_row, s_col), (e_row, e_col))));
+                }
+            }
+        }
+
+        // 2. Try single line matching
+        let matches = find_links_in_chars(&line_chars);
+        for (target, s, e) in matches {
+            if col >= s && col <= e {
+                return Some((target, ((row, s), (row, e))));
+            }
+        }
+
+        None
+    }
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || c == '/'
+        || c == '_'
+        || c == '-'
+        || c == '.'
+        || c == '+'
+        || c == '@'
+        || c == '%'
+        || c == '~'
+        || c == '!'
+        || c == ':'
+        || c == '#'
+}
+
+fn is_token_boundary(c: char) -> bool {
+    c.is_whitespace() || c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '='
+}
+
+fn is_valid_link_target(target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("file://")
+        || target.starts_with('/')
+        || target.starts_with("~/")
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || is_source_file_path(target)
+}
+
+fn is_valid_absolute_path(path: &str) -> bool {
+    if !path.starts_with('/') || path.len() < 2 {
+        return false;
+    }
+    let clean = path.split(&[':', '#'][..]).next().unwrap_or(path);
+    if clean.len() < 2 || clean.starts_with("//") {
+        return false;
+    }
+    let segments: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return false;
+    }
+    let first = segments[0];
+    let is_std_root = matches!(
+        first,
+        "home" | "usr" | "etc" | "tmp" | "var" | "opt" | "root" | "dev" | "proc" | "sys" | "mnt" | "media" | "bin" | "lib" | "lib64"
+    );
+    if is_std_root {
+        true
+    } else {
+        segments.len() >= 2
+    }
+}
+
+fn is_source_file_path(token: &str) -> bool {
+    let clean = token.split(&[':', '#'][..]).next().unwrap_or(token);
+    if clean.is_empty() {
+        return false;
+    }
+
+    let file_name = clean.split('/').last().unwrap_or(clean);
+    let known_exact_files = [
+        "Cargo.toml", "Cargo.lock", "Makefile", "Dockerfile", "README.md",
+        "LICENSE", "package.json", "package-lock.json", "tsconfig.json",
+        ".gitignore", "rules.json", "firestore.rules"
+    ];
+    if known_exact_files.iter().any(|&f| f.eq_ignore_ascii_case(file_name)) {
+        return true;
+    }
+
+    if let Some(ext) = clean.rsplit('.').next() {
+        if ext == clean {
+            return false;
+        }
+        let ext_lower = ext.to_ascii_lowercase();
+        let known_extensions = [
+            "rs", "toml", "json", "md", "txt", "c", "h", "cpp", "hpp", "cc",
+            "py", "js", "ts", "tsx", "jsx", "go", "sh", "bash", "zsh", "yaml",
+            "yml", "lock", "rules", "diff", "patch", "html", "css", "xml", "svg",
+            "png", "jpg", "jpeg", "gif", "webp", "ini", "conf", "sql", "proto"
+        ];
+        if known_extensions.contains(&ext_lower.as_str()) {
+            if clean.contains('/') || token.contains(':') || token.contains('#') {
+                return true;
+            }
+            let stem = file_name.strip_suffix(&format!(".{}", ext)).unwrap_or("");
+            return stem.len() >= 2;
+        }
+    }
+
+    false
+}
+
+pub fn find_links_in_chars(chars: &[char]) -> Vec<(String, usize, usize)> {
+    let mut results = Vec::new();
+    let len = chars.len();
+    if len == 0 {
+        return results;
+    }
+
+    let mut i = 0;
+    while i < len {
+        // 1. Markdown link: [Label](Target)
+        if chars[i] == '[' {
+            let start_bracket = i;
+            let mut sep_idx = None;
+            let mut j = start_bracket + 1;
+            while j < len {
+                if chars[j] == '[' {
+                    break;
+                }
+                if chars[j] == ']' && j + 1 < len && chars[j + 1] == '(' {
+                    sep_idx = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+
+            if let Some(sep) = sep_idx {
+                let mut close_paren = None;
+                let mut k = sep + 2;
+                while k < len {
+                    if chars[k] == ')' {
+                        close_paren = Some(k);
                         break;
                     }
-                    if line_chars[j] == ']' && j + 1 < line_chars.len() && line_chars[j + 1] == '(' {
-                        sep_idx = Some(j);
+                    if chars[k].is_whitespace() || chars[k] == '[' || chars[k] == '(' {
                         break;
                     }
-                    j += 1;
+                    k += 1;
                 }
 
-                if let Some(sep) = sep_idx {
-                    let mut end_paren = None;
-                    let mut k = sep + 2;
-                    while k < line_chars.len() {
-                        if line_chars[k] == ')' {
-                            end_paren = Some(k);
-                            break;
-                        }
-                        if line_chars[k].is_whitespace() || line_chars[k] == '(' || line_chars[k] == '[' {
-                            break;
-                        }
-                        k += 1;
-                    }
-
-                    if let Some(close_paren) = end_paren {
-                        let raw_url: String = line_chars[sep + 2..close_paren].iter().collect();
-                        let url = raw_url.trim_matches(|c| c == '<' || c == '>').trim().to_string();
-                        if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("file://") {
-                            if col >= start_idx && col <= close_paren {
-                                return Some((url, ((row, start_idx), (row, close_paren))));
-                            }
-                            idx = close_paren + 1;
-                            continue;
-                        }
+                if let Some(cp) = close_paren {
+                    let raw_target: String = chars[sep + 2..cp].iter().collect();
+                    let target = raw_target.trim_matches(|c| c == '<' || c == '>').trim().to_string();
+                    if is_valid_link_target(&target) {
+                        results.push((target, start_bracket, cp));
+                        i = cp + 1;
+                        continue;
                     }
                 }
             }
-            idx += 1;
         }
 
-        // 2. Detect Standalone URLs (https://, http://, file://)
+        // 2. Explicit URI: file://, https://, http://
         let https_prefix = ['h', 't', 't', 'p', 's', ':', '/', '/'];
         let http_prefix = ['h', 't', 't', 'p', ':', '/', '/'];
         let file_prefix = ['f', 'i', 'l', 'e', ':', '/', '/'];
 
-        let mut i = 0;
-        while i < line_chars.len() {
-            let prefix_len = if line_chars[i..].starts_with(&https_prefix) {
-                https_prefix.len()
-            } else if line_chars[i..].starts_with(&http_prefix) {
-                http_prefix.len()
-            } else if line_chars[i..].starts_with(&file_prefix) {
-                file_prefix.len()
-            } else {
-                i += 1;
-                continue;
-            };
+        let is_https = chars[i..].starts_with(&https_prefix);
+        let is_http = chars[i..].starts_with(&http_prefix);
+        let is_file = chars[i..].starts_with(&file_prefix);
 
+        if is_https || is_http || is_file {
             let start_col = i;
+            let prefix_len = if is_https { 8 } else { 7 };
             let mut end_col = start_col + prefix_len;
 
-            while end_col < line_chars.len() {
-                let ch = line_chars[end_col];
-                if ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '`' || ch == '<' || ch == '>' || ch == '(' || ch == ')' || ch == '[' || ch == ']' {
+            while end_col < len {
+                let ch = chars[end_col];
+                if ch.is_whitespace()
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '`'
+                    || ch == '<'
+                    || ch == '>'
+                    || ch == '('
+                    || ch == ')'
+                    || ch == '['
+                    || ch == ']'
+                    || ch == '{'
+                    || ch == '}'
+                {
                     break;
                 }
                 end_col += 1;
             }
 
-            // Trim trailing punctuation like '.', ',', ';', ':'
-            while end_col > start_col {
-                let last_ch = line_chars[end_col - 1];
-                if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == ':' {
+            while end_col > start_col + prefix_len {
+                let last_ch = chars[end_col - 1];
+                if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == ':' || last_ch == '!' || last_ch == '?' {
                     end_col -= 1;
                 } else {
                     break;
                 }
             }
 
-            if col >= start_col && col < end_col {
-                let url: String = line_chars[start_col..end_col].iter().collect();
-                return Some((url, ((row, start_col), (row, end_col - 1))));
+            if end_col > start_col + prefix_len {
+                let url: String = chars[start_col..end_col].iter().collect();
+                results.push((url, start_col, end_col - 1));
+                i = end_col;
+                continue;
             }
-
-            i = end_col.max(start_col + 1);
         }
 
-        None
+        // 3. Absolute path (/home/..., /usr/..., /etc/..., etc.)
+        if chars[i] == '/' {
+            let prev_is_char = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '/');
+            if !prev_is_char {
+                let start_col = i;
+                let mut end_col = start_col + 1;
+                while end_col < len {
+                    let ch = chars[end_col];
+                    if is_path_char(ch) {
+                        end_col += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                while end_col > start_col + 1 {
+                    let last_ch = chars[end_col - 1];
+                    if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == '!' || last_ch == '?' {
+                        end_col -= 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let path_candidate: String = chars[start_col..end_col].iter().collect();
+                if is_valid_absolute_path(&path_candidate) {
+                    results.push((path_candidate, start_col, end_col - 1));
+                    i = end_col;
+                    continue;
+                }
+            }
+        }
+
+        // 4. Home-relative path (~/...)
+        if chars[i] == '~' && i + 1 < len && chars[i + 1] == '/' {
+            let prev_is_char = i > 0 && chars[i - 1].is_alphanumeric();
+            if !prev_is_char {
+                let start_col = i;
+                let mut end_col = start_col + 2;
+                while end_col < len {
+                    let ch = chars[end_col];
+                    if is_path_char(ch) {
+                        end_col += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                while end_col > start_col + 2 {
+                    let last_ch = chars[end_col - 1];
+                    if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == '!' || last_ch == '?' {
+                        end_col -= 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if end_col > start_col + 2 {
+                    let path_candidate: String = chars[start_col..end_col].iter().collect();
+                    results.push((path_candidate, start_col, end_col - 1));
+                    i = end_col;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Explicit relative path (./... or ../...)
+        let starts_with_dot_slash = chars[i] == '.' && i + 1 < len && chars[i + 1] == '/';
+        let starts_with_dot_dot_slash = chars[i] == '.' && i + 2 < len && chars[i + 1] == '.' && chars[i + 2] == '/';
+        if starts_with_dot_slash || starts_with_dot_dot_slash {
+            let prev_is_char = i > 0 && chars[i - 1].is_alphanumeric();
+            if !prev_is_char {
+                let start_col = i;
+                let min_len = if starts_with_dot_slash { 2 } else { 3 };
+                let mut end_col = start_col + min_len;
+                while end_col < len {
+                    let ch = chars[end_col];
+                    if is_path_char(ch) {
+                        end_col += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                while end_col > start_col + min_len {
+                    let last_ch = chars[end_col - 1];
+                    if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == '!' || last_ch == '?' {
+                        end_col -= 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if end_col > start_col + min_len {
+                    let path_candidate: String = chars[start_col..end_col].iter().collect();
+                    results.push((path_candidate, start_col, end_col - 1));
+                    i = end_col;
+                    continue;
+                }
+            }
+        }
+
+        // 6. Project file / source file path with extension (e.g. src/widget.rs:883, Cargo.toml)
+        let is_token_start = i == 0 || is_token_boundary(chars[i - 1]);
+        if is_token_start && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            let start_col = i;
+            let mut end_col = start_col + 1;
+            while end_col < len {
+                let ch = chars[end_col];
+                if is_path_char(ch) {
+                    end_col += 1;
+                } else {
+                    break;
+                }
+            }
+
+            while end_col > start_col {
+                let last_ch = chars[end_col - 1];
+                if last_ch == '.' || last_ch == ',' || last_ch == ';' || last_ch == '!' || last_ch == '?' {
+                    end_col -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            let token: String = chars[start_col..end_col].iter().collect();
+            if is_source_file_path(&token) {
+                results.push((token, start_col, end_col - 1));
+                i = end_col;
+                continue;
+            }
+        }
+
+        i += 1;
     }
+
+    results
 }

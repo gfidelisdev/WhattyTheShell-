@@ -42,8 +42,10 @@ mod imp {
         pub hovered_link: RefCell<Option<((usize, usize), (usize, usize))>>,
         pub hovered_url: RefCell<Option<String>>,
         pub ctrl_pressed: RefCell<bool>,
+        pub last_mouse_pos: RefCell<Option<(f64, f64)>>,
         pub drag_start: RefCell<Option<(usize, usize)>>,
         pub custom_title: RefCell<Option<String>>,
+        pub dpi_handler_id: RefCell<Option<glib::SignalHandlerId>>,
     }
 
     #[derive(Default)]
@@ -82,7 +84,16 @@ mod imp {
         }
 
         fn dispose(&self) {
-            let _ = self.inner.borrow_mut().take();
+            if let Some(inner) = self.inner.borrow_mut().take() {
+                if let Some(id) = inner.dpi_handler_id.borrow_mut().take() {
+                    if let Some(settings) = gtk4::Settings::default() {
+                        settings.disconnect(id);
+                    }
+                }
+                if let Ok(mut pty) = inner.pty.lock() {
+                    pty.terminate();
+                }
+            }
         }
     }
 
@@ -233,6 +244,20 @@ fn current_dpi_scale() -> f32 {
 }
 
 impl TerminalView {
+    /// Explicitly terminate the terminal, killing the child process group and releasing all GPU/memory resources.
+    pub fn terminate(&self) {
+        if let Some(inner) = self.imp().inner.borrow_mut().take() {
+            if let Some(id) = inner.dpi_handler_id.borrow_mut().take() {
+                if let Some(settings) = gtk4::Settings::default() {
+                    settings.disconnect(id);
+                }
+            }
+            if let Ok(mut pty) = inner.pty.lock() {
+                pty.terminate();
+            }
+        }
+    }
+
     pub fn sync_scale_and_dimensions(&self, log_w: u32, log_h: u32) -> bool {
         let inner_guard = self.imp().inner.borrow();
         let inner = match inner_guard.as_ref() {
@@ -341,8 +366,10 @@ impl TerminalView {
             hovered_link: RefCell::new(None),
             hovered_url: RefCell::new(None),
             ctrl_pressed: RefCell::new(false),
+            last_mouse_pos: RefCell::new(None),
             drag_start: RefCell::new(None),
             custom_title: RefCell::new(None),
+            dpi_handler_id: RefCell::new(None),
         };
 
         widget.imp().inner.replace(Some(inner));
@@ -485,6 +512,18 @@ impl TerminalView {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
                     if keyval == gdk::Key::Control_L || keyval == gdk::Key::Control_R || is_ctrl {
                         *inner.ctrl_pressed.borrow_mut() = true;
+                        if let Some((x, y)) = *inner.last_mouse_pos.borrow() {
+                            if let Some((row, col)) = w.pixel_to_cell(x, y) {
+                                if let Ok(term) = inner.terminal.lock() {
+                                    if let Some((url, span)) = term.url_at(row, col) {
+                                        w.set_cursor_from_name(Some("pointer"));
+                                        *inner.hovered_link.borrow_mut() = Some(span);
+                                        *inner.hovered_url.borrow_mut() = Some(url);
+                                        w.queue_draw();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -608,10 +647,24 @@ impl TerminalView {
                     }
                 }
                 gdk::Key::BackSpace => {
+                    let kitty_active = term_for_keys
+                        .lock()
+                        .map(|t| t.kitty_keyboard_flags() > 0)
+                        .unwrap_or(false);
+
                     if is_ctrl && !is_shift && !is_alt {
-                        bytes.push(0x08);
+                        if kitty_active {
+                            bytes.extend_from_slice(b"\x1b[127;5u");
+                        } else {
+                            // Ctrl+Backspace deletes previous word (standard readline / terminal rubout)
+                            bytes.push(0x17); // 0x17 = ^W (unix-word-rubout)
+                        }
                     } else if is_alt && !is_shift && !is_ctrl {
-                        bytes.extend_from_slice(b"\x1b\x7f");
+                        if kitty_active {
+                            bytes.extend_from_slice(b"\x1b[127;3u");
+                        } else {
+                            bytes.extend_from_slice(b"\x1b\x7f");
+                        }
                     } else {
                         bytes.extend_from_slice(b"\x7f");
                     }
@@ -941,6 +994,7 @@ impl TerminalView {
         motion_controller.connect_motion(move |_, x, y| {
             if let Some(w) = motion_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    *inner.last_mouse_pos.borrow_mut() = Some((x, y));
                     let is_ctrl = *inner.ctrl_pressed.borrow()
                         || motion_ctrl.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
                     if is_ctrl {
@@ -965,6 +1019,21 @@ impl TerminalView {
                 }
             }
         });
+
+        let motion_leave_w = widget.downgrade();
+        motion_controller.connect_leave(move |_| {
+            if let Some(w) = motion_leave_w.upgrade() {
+                if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    *inner.last_mouse_pos.borrow_mut() = None;
+                    if inner.hovered_link.borrow().is_some() {
+                        *inner.hovered_link.borrow_mut() = None;
+                        *inner.hovered_url.borrow_mut() = None;
+                        w.set_cursor_from_name(Some("text"));
+                        w.queue_draw();
+                    }
+                }
+            }
+        });
         widget.add_controller(motion_controller);
 
         let widget_for_scale = widget.downgrade();
@@ -982,7 +1051,7 @@ impl TerminalView {
 
         if let Some(settings) = gtk4::Settings::default() {
             let widget_for_dpi = widget.downgrade();
-            settings.connect_notify_local(Some("gtk-xft-dpi"), move |_, _| {
+            let handler_id = settings.connect_notify_local(Some("gtk-xft-dpi"), move |_, _| {
                 if let Some(w) = widget_for_dpi.upgrade() {
                     let log_w = w.imp().inner.borrow().as_ref().map(|i| *i.logical_width.borrow()).unwrap_or(0);
                     let log_h = w.imp().inner.borrow().as_ref().map(|i| *i.logical_height.borrow()).unwrap_or(0);
@@ -993,6 +1062,9 @@ impl TerminalView {
                     }
                 }
             });
+            if let Some(inner) = widget.imp().inner.borrow().as_ref() {
+                *inner.dpi_handler_id.borrow_mut() = Some(handler_id);
+            }
         }
 
         let widget_for_realize = widget.downgrade();
@@ -1202,7 +1274,7 @@ impl TerminalView {
     }
 
     pub fn open_url(&self, url: &str) {
-        let url = url.trim().to_string();
+        let url = url.trim();
         if url.is_empty() {
             return;
         }
@@ -1210,64 +1282,197 @@ impl TerminalView {
         let root = self.root();
         let window = root.as_ref().and_then(|r| r.downcast_ref::<gtk4::Window>());
 
-        if url.starts_with("file://") {
-            let clean_uri = url.split('#').next().unwrap_or(&url);
-            let file = gtk4::gio::File::for_uri(clean_uri);
-            let launcher = gtk4::FileLauncher::new(Some(&file));
-            let clean_uri_clone = clean_uri.to_string();
-            let file_clone = file.clone();
-
+        // 1. Web links (HTTP / HTTPS)
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let launcher = gtk4::UriLauncher::new(url);
+            let url_clone = url.to_string();
             launcher.launch(window, None::<&gtk4::gio::Cancellable>, move |res| {
                 if let Err(err) = res {
-                    eprintln!("[Whatty] FileLauncher failed ({}), attempting Gio launch...", err);
+                    eprintln!("[Whatty] UriLauncher failed ({}), attempting Gio launch...", err);
                     let display = gdk::Display::default();
                     let context = display.as_ref().map(|d| d.app_launch_context());
                     let gio_res = gtk4::gio::AppInfo::launch_default_for_uri(
-                        &clean_uri_clone,
+                        &url_clone,
                         context.as_ref(),
                     );
                     if let Err(gio_err) = gio_res {
                         eprintln!("[Whatty] Gio launch failed ({}), falling back to xdg-open...", gio_err);
-                        let path_arg = file_clone
-                            .path()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| clean_uri_clone.clone());
-
-                        if let Err(cmd_err) = std::process::Command::new("xdg-open")
-                            .arg(&path_arg)
-                            .spawn()
-                        {
-                            eprintln!("[Whatty] Failed to open file via xdg-open: {}", cmd_err);
-                        }
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&url_clone)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
                     }
                 }
             });
             return;
         }
 
-        // 1. Try GtkUriLauncher (GTK 4.10+) with parent window
-        let launcher = gtk4::UriLauncher::new(&url);
-        let url_clone = url.clone();
-        launcher.launch(window, None::<&gtk4::gio::Cancellable>, move |res| {
-            if let Err(err) = res {
-                eprintln!("[Whatty] UriLauncher failed ({}), attempting Gio launch...", err);
-                let display = gdk::Display::default();
-                let context = display.as_ref().map(|d| d.app_launch_context());
-                let gio_res = gtk4::gio::AppInfo::launch_default_for_uri(
-                    &url_clone,
-                    context.as_ref(),
-                );
-                if let Err(gio_err) = gio_res {
-                    eprintln!("[Whatty] Gio launch failed ({}), falling back to xdg-open...", gio_err);
-                    if let Err(cmd_err) = std::process::Command::new("xdg-open")
-                        .arg(&url_clone)
-                        .spawn()
-                    {
-                        eprintln!("[Whatty] Failed to open URL via xdg-open: {}", cmd_err);
-                    }
-                }
+        // 2. Filesystem paths & file:// URLs
+        let (raw_path, line, col) = parse_path_and_location(url);
+
+        // Expand home directory ~
+        let expanded_path = if raw_path.starts_with("~/") || raw_path == "~" {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/gfidelis".to_string());
+            if raw_path == "~" {
+                std::path::PathBuf::from(home)
+            } else {
+                std::path::PathBuf::from(home).join(&raw_path[2..])
             }
-        });
+        } else {
+            std::path::PathBuf::from(&raw_path)
+        };
+
+        // Resolve relative paths with terminal's current working directory
+        let final_path = if expanded_path.is_relative() {
+            if let Some(cwd) = self.current_working_dir() {
+                let joined = cwd.join(&expanded_path);
+                if joined.exists() {
+                    joined
+                } else {
+                    std::env::current_dir().map(|d| d.join(&expanded_path)).unwrap_or(joined)
+                }
+            } else {
+                std::env::current_dir().map(|d| d.join(&expanded_path)).unwrap_or(expanded_path)
+            }
+        } else {
+            expanded_path
+        };
+
+        // A. If line number is specified, try code --goto first
+        if let Some(l) = line {
+            let goto_arg = if let Some(c) = col {
+                format!("{}:{}:{}", final_path.display(), l, c)
+            } else {
+                format!("{}:{}", final_path.display(), l)
+            };
+
+            if let Ok(_) = std::process::Command::new("code")
+                .arg("--goto")
+                .arg(&goto_arg)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                return;
+            }
+        }
+
+        // B. Try opening via xdg-open directly (standard default desktop opener)
+        if let Ok(_) = std::process::Command::new("xdg-open")
+            .arg(&final_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            return;
+        }
+
+        // C. Fallback to Gio FileLauncher
+        let uri = format!("file://{}", final_path.display());
+        let file = gtk4::gio::File::for_uri(&uri);
+        let launcher = gtk4::FileLauncher::new(Some(&file));
+        launcher.launch(window, None::<&gtk4::gio::Cancellable>, move |_| {});
     }
 }
+
+fn parse_path_and_location(raw: &str) -> (String, Option<usize>, Option<usize>) {
+    let s = raw.strip_prefix("file://").unwrap_or(raw);
+
+    // Check #L anchor (e.g. #L123-L145 or #L123)
+    if let Some((path, anchor)) = s.split_once('#') {
+        let line = if anchor.starts_with('L') || anchor.starts_with('l') {
+            let num_str = anchor[1..]
+                .split('-')
+                .next()
+                .unwrap_or("")
+                .trim();
+            num_str.parse::<usize>().ok()
+        } else {
+            anchor.parse::<usize>().ok()
+        };
+        return (path.to_string(), line, None);
+    }
+
+    // Check :line:col or :line suffix
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() >= 3 {
+        let last = parts[parts.len() - 1];
+        let second_last = parts[parts.len() - 2];
+        if let (Ok(col), Ok(line)) = (last.parse::<usize>(), second_last.parse::<usize>()) {
+            let path = parts[..parts.len() - 2].join(":");
+            return (path, Some(line), Some(col));
+        }
+    }
+    if parts.len() >= 2 {
+        let last = parts[parts.len() - 1];
+        if let Ok(line) = last.parse::<usize>() {
+            let path = parts[..parts.len() - 1].join(":");
+            return (path, Some(line), None);
+        }
+    }
+
+    (s.to_string(), None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_terminal_view_terminate_reaps_child() {
+        if gtk4::is_initialized() {
+            if !gtk4::is_initialized_main_thread() {
+                return;
+            }
+        } else if gtk4::init().is_err() {
+            return;
+        }
+
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let view = TerminalView::with_working_dir(device, queue, None, 12.0, None).unwrap();
+        let child_pid = {
+            let inner_guard = view.imp().inner.borrow();
+            let inner = inner_guard.as_ref().unwrap();
+            let pty = inner.pty.lock().unwrap();
+            pty.child_pid()
+        };
+
+        // Ensure child is running initially
+        assert!(child_pid > 0);
+        let status = unsafe { libc::kill(child_pid as i32, 0) };
+        assert_eq!(status, 0);
+
+        // Terminate view
+        view.terminate();
+
+        // Ensure inner is cleared
+        assert!(view.imp().inner.borrow().is_none());
+
+        // Ensure child process is terminated (kill with 0 returns -1 with ESRCH)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let status = unsafe { libc::kill(child_pid as i32, 0) };
+        assert_ne!(status, 0);
+    }
+}
+
 

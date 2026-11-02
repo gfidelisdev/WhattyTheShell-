@@ -181,6 +181,7 @@ pub fn close_pane(
     view_to_close: &TerminalView,
     notebook: &gtk4::Notebook,
 ) -> Option<Widget> {
+    view_to_close.terminate();
     let target_widget = view_to_close.clone().upcast::<Widget>();
     let parent = target_widget.parent()?;
 
@@ -238,6 +239,13 @@ pub fn unsplit_terminal(
     let target_widget = view.clone().upcast::<Widget>();
     if page_root == target_widget {
         return false;
+    }
+
+    let other_terminals = find_terminals(&page_root);
+    for t in other_terminals {
+        if &t != view {
+            t.terminate();
+        }
     }
 
     if let Some(parent) = target_widget.parent() {

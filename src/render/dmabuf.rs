@@ -321,5 +321,31 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_dmabuf_frame_drop_no_fd_leak() {
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, _) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let initial_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        for _ in 0..50 {
+            let frame = DmabufFrame::new(&device, 100, 100).unwrap();
+            drop(frame);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let final_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert!(final_fds <= initial_fds + 2, "FD leak on frame drop! initial={initial_fds}, final={final_fds}");
+    }
 }
 

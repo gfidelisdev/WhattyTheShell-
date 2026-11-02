@@ -834,6 +834,59 @@ mod tests {
         let (extracted6, span6) = code_click.unwrap();
         assert_eq!(extracted6, "file:///path/to/src/widget.rs#L42");
         assert_eq!(span6, ((0, 8), (0, 59)));
+
+        // Absolute filesystem path with line and column: /home/gfidelis/Code/src/main.rs:123:45
+        let mut t6 = Terminal::new(100, 2);
+        t6.advance(b"Error at /home/gfidelis/Code/src/main.rs:123:45 in parser");
+        let abs_path_click = t6.url_at(0, 20);
+        assert!(abs_path_click.is_some());
+        let (extracted7, span7) = abs_path_click.unwrap();
+        assert_eq!(extracted7, "/home/gfidelis/Code/src/main.rs:123:45");
+        assert_eq!(span7, ((0, 9), (0, 46)));
+
+        // Home relative path: ~/Code/rust/WhattyTheShell!/Cargo.toml
+        let mut t7 = Terminal::new(100, 2);
+        t7.advance(b"Config: ~/Code/rust/WhattyTheShell!/Cargo.toml ready");
+        let home_path_click = t7.url_at(0, 12);
+        assert!(home_path_click.is_some());
+        let (extracted8, span8) = home_path_click.unwrap();
+        assert_eq!(extracted8, "~/Code/rust/WhattyTheShell!/Cargo.toml");
+        assert_eq!(span8, ((0, 8), (0, 45)));
+
+        // Relative path with line/col from compiler error: --> src/widget.rs:883:25
+        let mut t8 = Terminal::new(100, 2);
+        t8.advance(b"  --> src/widget.rs:883:25");
+        let rel_path_click = t8.url_at(0, 10);
+        assert!(rel_path_click.is_some());
+        let (extracted9, span9) = rel_path_click.unwrap();
+        assert_eq!(extracted9, "src/widget.rs:883:25");
+        assert_eq!(span9, ((0, 6), (0, 25)));
+
+        // Backtick enclosed file: `file:///home/gfidelis/test.txt`
+        let mut t9 = Terminal::new(100, 2);
+        t9.advance(b"File Path: `file:///home/gfidelis/test.txt`");
+        let backtick_click = t9.url_at(0, 18);
+        assert!(backtick_click.is_some());
+        let (extracted10, span10) = backtick_click.unwrap();
+        assert_eq!(extracted10, "file:///home/gfidelis/test.txt");
+        assert_eq!(span10, ((0, 12), (0, 41)));
+
+        // Multi-line wrapped link across rows
+        let mut t10 = Terminal::new(40, 3);
+        t10.advance(b"Check [Cargo.toml](file:///home/gfidelis/Code/rust/WhattyTheShell!/Cargo.toml) now");
+        // Row 0 click inside label Cargo.toml
+        let wrapped_row0_click = t10.url_at(0, 10);
+        assert!(wrapped_row0_click.is_some());
+        let (w_url0, w_span0) = wrapped_row0_click.unwrap();
+        assert_eq!(w_url0, "file:///home/gfidelis/Code/rust/WhattyTheShell!/Cargo.toml");
+        assert_eq!(w_span0.0, (0, 6));
+
+        // Row 1 click inside the continuation on row 1
+        let wrapped_row1_click = t10.url_at(1, 10);
+        assert!(wrapped_row1_click.is_some());
+        let (w_url1, w_span1) = wrapped_row1_click.unwrap();
+        assert_eq!(w_url1, "file:///home/gfidelis/Code/rust/WhattyTheShell!/Cargo.toml");
+        assert_eq!(w_span1.0, (0, 6));
     }
 
     #[test]
