@@ -315,7 +315,7 @@ fn get_or_create_shared_pipeline(
     };
     let mutex = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = mutex.lock().unwrap();
-    if let (Some(vk_dev), Some((cached_dev, ref state))) = (vk_dev, guard.as_ref()) {
+    if let (Some(vk_dev), Some((cached_dev, state))) = (vk_dev, guard.as_ref()) {
         if *cached_dev == vk_dev {
             return state.clone();
         }

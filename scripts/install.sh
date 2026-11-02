@@ -22,6 +22,11 @@ META_DIR="$DATADIR/whattytheshell"
 # 1. Create target directories
 mkdir -p "$BINDIR" "$APPDIR" "$META_DIR"
 
+# When run from the source tree, always rebuild so we never install a stale binary
+if [ -f "$SCRIPT_DIR/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+  cargo build --release --manifest-path "$SCRIPT_DIR/../Cargo.toml" || exit 1
+fi
+
 # 2. Install executable
 if [ -f "$SCRIPT_DIR/bin/WhattyTheShell" ]; then
   SRC_BIN="$SCRIPT_DIR/bin/WhattyTheShell"

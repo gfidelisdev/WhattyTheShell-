@@ -1,6 +1,6 @@
 [package]
 name = "WhattyTheShell"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "GTK4 GPU-accelerated terminal emulator with Vulkan rendering"
 license = "MIT"
