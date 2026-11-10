@@ -157,6 +157,27 @@ impl Terminal {
         self.state.grid().extract_text_with_offset(start, end, self.state.display_offset)
     }
 
+    pub fn extract_text_buffer(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        self.state.grid().extract_text_buffer(start, end)
+    }
+
+    pub fn viewport_to_buffer_row(&self, viewport_row: usize) -> usize {
+        let grid = self.grid();
+        (grid.scrollback.len() + viewport_row).saturating_sub(self.display_offset())
+    }
+
+    pub fn buffer_to_viewport_row(&self, buffer_row: usize) -> Option<usize> {
+        let grid = self.grid();
+        let sb_len = grid.scrollback.len();
+        let offset = self.display_offset();
+        let v_row = (buffer_row as isize) + (offset as isize) - (sb_len as isize);
+        if v_row >= 0 && (v_row as usize) < grid.rows {
+            Some(v_row as usize)
+        } else {
+            None
+        }
+    }
+
     pub fn word_at(&self, row: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
         self.state.grid().word_at_with_offset(row, col, self.state.display_offset)
     }
@@ -947,6 +968,52 @@ mod tests {
         t.scroll_to_top();
         assert_eq!(t.display_offset(), 2);
         assert_eq!(t.extract_text((0, 0), (0, 5)), "line 0");
+    }
+
+    #[test]
+    fn test_buffer_selection_and_scroll_invariance() {
+        let mut t = Terminal::new(20, 3);
+        t.advance(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4");
+        // Total lines in buffer: 5. Scrollback has 2, live screen has 3.
+        assert_eq!(t.grid().total_lines(), 5);
+        assert_eq!(t.grid().scrollback.len(), 2);
+        assert_eq!(t.display_offset(), 0);
+
+        // Viewport to buffer row at display_offset 0:
+        // Viewport rows 0, 1, 2 correspond to buffer rows 2, 3, 4
+        assert_eq!(t.viewport_to_buffer_row(0), 2);
+        assert_eq!(t.viewport_to_buffer_row(1), 3);
+        assert_eq!(t.viewport_to_buffer_row(2), 4);
+
+        // Buffer to viewport row at display_offset 0:
+        assert_eq!(t.buffer_to_viewport_row(2), Some(0));
+        assert_eq!(t.buffer_to_viewport_row(3), Some(1));
+        assert_eq!(t.buffer_to_viewport_row(4), Some(2));
+        assert_eq!(t.buffer_to_viewport_row(1), None); // in scrollback, not visible
+
+        // Extracting text via buffer coordinates:
+        assert_eq!(t.extract_text_buffer((0, 0), (0, 5)), "line 0");
+        assert_eq!(t.extract_text_buffer((1, 0), (1, 5)), "line 1");
+        assert_eq!(t.extract_text_buffer((2, 0), (2, 5)), "line 2");
+        assert_eq!(t.extract_text_buffer((0, 0), (4, 5)), "line 0\nline 1\nline 2\nline 3\nline 4");
+
+        // Now scroll up 2 lines (to top of scrollback):
+        t.scroll_display(2);
+        assert_eq!(t.display_offset(), 2);
+
+        // Viewport rows 0, 1, 2 now correspond to buffer rows 0, 1, 2
+        assert_eq!(t.viewport_to_buffer_row(0), 0);
+        assert_eq!(t.viewport_to_buffer_row(1), 1);
+        assert_eq!(t.viewport_to_buffer_row(2), 2);
+
+        assert_eq!(t.buffer_to_viewport_row(0), Some(0));
+        assert_eq!(t.buffer_to_viewport_row(1), Some(1));
+        assert_eq!(t.buffer_to_viewport_row(2), Some(2));
+        assert_eq!(t.buffer_to_viewport_row(4), None); // below viewport
+
+        // Extracting text via buffer coordinates remains completely unchanged when scrolled!
+        assert_eq!(t.extract_text_buffer((2, 0), (2, 5)), "line 2");
+        assert_eq!(t.extract_text_buffer((0, 0), (4, 5)), "line 0\nline 1\nline 2\nline 3\nline 4");
     }
 
     #[test]

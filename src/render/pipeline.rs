@@ -645,13 +645,15 @@ impl TerminalRenderer {
                 break;
             }
 
+            let buffer_row = (grid.scrollback.len() + r).saturating_sub(display_offset);
+
             for (c, cell) in row.iter().enumerate() {
                 let x = c as f32 * cell_w;
                 if x >= width as f32 {
                     break;
                 }
 
-                let is_selected = selection.map(|s| s.contains(r, c)).unwrap_or(false);
+                let is_selected = selection.map(|s| s.contains(buffer_row, c)).unwrap_or(false);
                 let is_link = hovered_link.map(|(s, e)| {
                     if r < s.0 || r > e.0 {
                         false

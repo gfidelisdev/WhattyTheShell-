@@ -88,6 +88,8 @@ mod imp {
         pub ctrl_pressed: RefCell<bool>,
         pub last_mouse_pos: RefCell<Option<(f64, f64)>>,
         pub drag_start: RefCell<Option<(usize, usize)>>,
+        pub drag_mouse_pos: RefCell<Option<(f64, f64)>>,
+        pub autoscroll_source_id: RefCell<Option<glib::SourceId>>,
         pub custom_title: RefCell<Option<String>>,
         pub dpi_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub pty_source_id: RefCell<Option<glib::SourceId>>,
@@ -132,6 +134,9 @@ mod imp {
         fn dispose(&self) {
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+                if let Some(source_id) = inner.autoscroll_source_id.borrow_mut().take() {
+                    source_id.remove();
+                }
                 if let Some(source_id) = inner.pty_source_id.borrow_mut().take() {
                     source_id.remove();
                 }
@@ -302,6 +307,9 @@ impl TerminalView {
     pub fn terminate(&self) {
         if let Some(inner) = self.imp().inner.borrow_mut().take() {
             inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+            if let Some(source_id) = inner.autoscroll_source_id.borrow_mut().take() {
+                source_id.remove();
+            }
             if let Some(source_id) = inner.pty_source_id.borrow_mut().take() {
                 source_id.remove();
             }
@@ -438,6 +446,8 @@ impl TerminalView {
             ctrl_pressed: RefCell::new(false),
             last_mouse_pos: RefCell::new(None),
             drag_start: RefCell::new(None),
+            drag_mouse_pos: RefCell::new(None),
+            autoscroll_source_id: RefCell::new(None),
             custom_title: RefCell::new(None),
             dpi_handler_id: RefCell::new(None),
             pty_source_id: RefCell::new(None),
@@ -947,6 +957,24 @@ impl TerminalView {
             term.scroll_display(lines);
             drop(term);
 
+            // If we are currently dragging, update selection with the new display_offset!
+            let start_and_mouse = {
+                let inner_guard = w.imp().inner.borrow();
+                inner_guard.as_ref().and_then(|i| {
+                    let start = (*i.drag_start.borrow())?;
+                    let mouse = (*i.drag_mouse_pos.borrow())?;
+                    Some((start, mouse))
+                })
+            };
+
+            if let Some((start_pos, (cur_x, cur_y))) = start_and_mouse {
+                if let Some(cur_pos) = w.pixel_to_buffer_cell(cur_x, cur_y) {
+                    if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                        *inner.selection.borrow_mut() = Some(SelectionRange::new(start_pos, cur_pos));
+                    }
+                }
+            }
+
             w.queue_draw();
 
             glib::Propagation::Stop
@@ -960,8 +988,12 @@ impl TerminalView {
         drag_controller.connect_drag_begin(move |_, x, y| {
             if let Some(w) = drag_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
-                    if let Some(pos) = w.pixel_to_cell(x, y) {
+                    if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+                        id.remove();
+                    }
+                    if let Some(pos) = w.pixel_to_buffer_cell(x, y) {
                         *inner.drag_start.borrow_mut() = Some(pos);
+                        *inner.drag_mouse_pos.borrow_mut() = Some((x, y));
                         *inner.selection.borrow_mut() = None;
                         w.queue_draw();
                     }
@@ -972,17 +1004,26 @@ impl TerminalView {
         let drag_update_w = widget.downgrade();
         drag_controller.connect_drag_update(move |drag_gesture_update, offset_x, offset_y| {
             if let Some(w) = drag_update_w.upgrade() {
-                if let Some(inner) = w.imp().inner.borrow().as_ref() {
-                    if let Some(start_pos) = *inner.drag_start.borrow() {
-                        let (start_x, start_y) = drag_gesture_update.start_point().unwrap_or((0.0, 0.0));
-                        let cur_x = start_x + offset_x;
-                        let cur_y = start_y + offset_y;
-                        if let Some(cur_pos) = w.pixel_to_cell(cur_x, cur_y) {
+                let (start_x, start_y) = drag_gesture_update.start_point().unwrap_or((0.0, 0.0));
+                let cur_x = start_x + offset_x;
+                let cur_y = start_y + offset_y;
+                let start_pos_opt = if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    *inner.drag_mouse_pos.borrow_mut() = Some((cur_x, cur_y));
+                    *inner.drag_start.borrow()
+                } else {
+                    None
+                };
+
+                if let Some(start_pos) = start_pos_opt {
+                    if let Some(cur_pos) = w.pixel_to_buffer_cell(cur_x, cur_y) {
+                        if let Some(inner) = w.imp().inner.borrow().as_ref() {
                             *inner.selection.borrow_mut() = Some(SelectionRange::new(start_pos, cur_pos));
                             w.queue_draw();
                         }
                     }
                 }
+
+                w.check_autoscroll();
             }
         });
 
@@ -990,9 +1031,14 @@ impl TerminalView {
         drag_controller.connect_drag_end(move |_, _, _| {
             if let Some(w) = drag_end_w.upgrade() {
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+                        id.remove();
+                    }
+                    *inner.drag_mouse_pos.borrow_mut() = None;
+
                     if let Some(sel) = *inner.selection.borrow() {
                         if let Ok(term) = inner.terminal.lock() {
-                            let text = term.extract_text(sel.start, sel.end);
+                            let text = term.extract_text_buffer(sel.start, sel.end);
                             if !text.is_empty() {
                                 w.display().primary_clipboard().set_text(&text);
                             }
@@ -1037,8 +1083,10 @@ impl TerminalView {
                             if let Some((row, col)) = w.pixel_to_cell(x, y) {
                                 if let Ok(term) = inner.terminal.lock() {
                                     if let Some((start, end)) = term.word_at(row, col) {
-                                        *inner.selection.borrow_mut() = Some(SelectionRange::new(start, end));
-                                        let text = term.extract_text(start, end);
+                                        let start_buf = (term.viewport_to_buffer_row(start.0), start.1);
+                                        let end_buf = (term.viewport_to_buffer_row(end.0), end.1);
+                                        *inner.selection.borrow_mut() = Some(SelectionRange::new(start_buf, end_buf));
+                                        let text = term.extract_text_buffer(start_buf, end_buf);
                                         if !text.is_empty() {
                                             w.display().primary_clipboard().set_text(&text);
                                         }
@@ -1051,8 +1099,11 @@ impl TerminalView {
                                 if let Ok(term) = inner.terminal.lock() {
                                     let cols = term.grid().cols;
                                     if cols > 0 {
-                                        *inner.selection.borrow_mut() = Some(SelectionRange::new((row, 0), (row, cols - 1)));
-                                        let text = term.extract_text((row, 0), (row, cols - 1));
+                                        let buf_row = term.viewport_to_buffer_row(row);
+                                        let start_buf = (buf_row, 0);
+                                        let end_buf = (buf_row, cols - 1);
+                                        *inner.selection.borrow_mut() = Some(SelectionRange::new(start_buf, end_buf));
+                                        let text = term.extract_text_buffer(start_buf, end_buf);
                                         if !text.is_empty() {
                                             w.display().primary_clipboard().set_text(&text);
                                         }
@@ -1061,6 +1112,9 @@ impl TerminalView {
                                 }
                             }
                         } else if n_press == 1 && !is_ctrl {
+                            if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+                                id.remove();
+                            }
                             if inner.drag_start.borrow().is_none() {
                                 *inner.selection.borrow_mut() = None;
                                 w.queue_draw();
@@ -1172,6 +1226,11 @@ impl TerminalView {
         // so inactive tabs do not hold ~8-16 MB of GPU/system RAM each.
         widget.connect_unmap(|w| {
             if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                if let Some(source_id) = inner.autoscroll_source_id.borrow_mut().take() {
+                    source_id.remove();
+                }
+                *inner.drag_start.borrow_mut() = None;
+                *inner.drag_mouse_pos.borrow_mut() = None;
                 let mut frames = inner.frames.borrow_mut();
                 if frames[0].is_some() || frames[1].is_some() {
                     *frames = [None, None];
@@ -1295,12 +1354,168 @@ impl TerminalView {
         Some((row, col))
     }
 
+    pub fn pixel_to_buffer_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let inner_guard = self.imp().inner.borrow();
+        let inner = inner_guard.as_ref()?;
+        let scale = *inner.scale_factor.borrow() as f64;
+        let renderer = inner.renderer.borrow();
+        let cell_w = renderer.atlas.cell_width as f64;
+        let cell_h = renderer.atlas.cell_height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let px = x * scale;
+        let py = y * scale;
+        let col = (px / cell_w).floor().max(0.0) as usize;
+        let row = (py / cell_h).floor().max(0.0) as usize;
+        let term = inner.terminal.lock().ok()?;
+        let grid = term.grid();
+        let col = col.min(grid.cols.saturating_sub(1));
+        let row = row.min(grid.rows.saturating_sub(1));
+        let buffer_row = (grid.scrollback.len() + row).saturating_sub(term.display_offset());
+        Some((buffer_row, col))
+    }
+
+    fn check_autoscroll(&self) {
+        let inner_guard = self.imp().inner.borrow();
+        let inner = match inner_guard.as_ref() {
+            Some(i) => i,
+            None => return,
+        };
+
+        if inner.drag_start.borrow().is_none() {
+            if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+                id.remove();
+            }
+            return;
+        }
+
+        let mouse_pos = *inner.drag_mouse_pos.borrow();
+        let (_cur_x, cur_y) = match mouse_pos {
+            Some(p) => p,
+            None => {
+                if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+                    id.remove();
+                }
+                return;
+            }
+        };
+
+        let log_h = *inner.logical_height.borrow() as f64;
+        let scale = *inner.scale_factor.borrow() as f64;
+        let cell_h = inner.renderer.borrow().atlas.cell_height as f64 / scale;
+        let margin = (cell_h * 0.8).max(12.0);
+
+        let in_top_zone = cur_y <= margin;
+        let in_bottom_zone = cur_y >= log_h - margin;
+
+        if in_top_zone || in_bottom_zone {
+            if inner.autoscroll_source_id.borrow().is_none() {
+                let weak_view = self.downgrade();
+                let source_id = glib::timeout_add_local(
+                    std::time::Duration::from_millis(35),
+                    move || {
+                        let view = match weak_view.upgrade() {
+                            Some(v) => v,
+                            None => return glib::ControlFlow::Break,
+                        };
+                        view.step_autoscroll()
+                    },
+                );
+                *inner.autoscroll_source_id.borrow_mut() = Some(source_id);
+            }
+        } else if let Some(id) = inner.autoscroll_source_id.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
+    fn step_autoscroll(&self) -> glib::ControlFlow {
+        let (start_pos, (cur_x, cur_y), log_h, _scale, cell_h) = {
+            let inner_guard = self.imp().inner.borrow();
+            let inner = match inner_guard.as_ref() {
+                Some(i) => i,
+                None => return glib::ControlFlow::Break,
+            };
+
+            let start_pos = match *inner.drag_start.borrow() {
+                Some(p) => p,
+                None => {
+                    *inner.autoscroll_source_id.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+            };
+
+            let mouse_pos = match *inner.drag_mouse_pos.borrow() {
+                Some(p) => p,
+                None => {
+                    *inner.autoscroll_source_id.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+            };
+
+            let log_h = *inner.logical_height.borrow() as f64;
+            let scale = *inner.scale_factor.borrow() as f64;
+            let cell_h = inner.renderer.borrow().atlas.cell_height as f64 / scale;
+
+            (start_pos, mouse_pos, log_h, scale, cell_h)
+        };
+
+        let margin = (cell_h * 0.8).max(12.0);
+        let in_top_zone = cur_y <= margin;
+        let in_bottom_zone = cur_y >= log_h - margin;
+
+        if !in_top_zone && !in_bottom_zone {
+            if let Some(inner) = self.imp().inner.borrow().as_ref() {
+                *inner.autoscroll_source_id.borrow_mut() = None;
+            }
+            return glib::ControlFlow::Break;
+        }
+
+        let lines = if in_top_zone {
+            if cur_y < 0.0 {
+                let factor = ((-cur_y) / cell_h.max(1.0)).floor() as isize;
+                (1 + factor).clamp(1, 4)
+            } else {
+                1
+            }
+        } else if cur_y > log_h {
+            let factor = ((cur_y - log_h) / cell_h.max(1.0)).floor() as isize;
+            -(1 + factor).clamp(1, 4)
+        } else {
+            -1
+        };
+
+        let mut changed = false;
+        if let Some(inner) = self.imp().inner.borrow().as_ref() {
+            if let Ok(mut term) = inner.terminal.lock() {
+                let prev_offset = term.display_offset();
+                term.scroll_display(lines);
+                if term.display_offset() != prev_offset {
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(cur_pos) = self.pixel_to_buffer_cell(cur_x, cur_y) {
+            if let Some(inner) = self.imp().inner.borrow().as_ref() {
+                *inner.selection.borrow_mut() = Some(SelectionRange::new(start_pos, cur_pos));
+            }
+            changed = true;
+        }
+
+        if changed {
+            self.queue_draw();
+        }
+
+        glib::ControlFlow::Continue
+    }
+
     pub fn copy_selection(&self) {
         let inner_guard = self.imp().inner.borrow();
         if let Some(inner) = inner_guard.as_ref() {
             if let Some(sel) = *inner.selection.borrow() {
                 if let Ok(term) = inner.terminal.lock() {
-                    let text = term.extract_text(sel.start, sel.end);
+                    let text = term.extract_text_buffer(sel.start, sel.end);
                     if !text.is_empty() {
                         self.display().clipboard().set_text(&text);
                         self.display().primary_clipboard().set_text(&text);
@@ -1573,6 +1788,56 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let status = unsafe { libc::kill(child_pid as i32, 0) };
         assert_ne!(status, 0);
+    }
+
+    #[test]
+    fn test_pixel_to_buffer_cell_and_scroll() {
+        if gtk4::is_initialized() {
+            if !gtk4::is_initialized_main_thread() {
+                return;
+            }
+        } else if gtk4::init().is_err() {
+            return;
+        }
+
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let view = TerminalView::with_working_dir(device, queue, None, 12.0, None).unwrap();
+        {
+            let inner_guard = view.imp().inner.borrow();
+            let inner = inner_guard.as_ref().unwrap();
+            let mut term = inner.terminal.lock().unwrap();
+            term.advance(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4");
+        }
+
+        let cell0 = view.pixel_to_buffer_cell(10.0, 10.0).unwrap();
+        // Scroll up
+        {
+            let inner_guard = view.imp().inner.borrow();
+            let inner = inner_guard.as_ref().unwrap();
+            let mut term = inner.terminal.lock().unwrap();
+            term.scroll_display(1);
+        }
+        let cell1 = view.pixel_to_buffer_cell(10.0, 10.0).unwrap();
+        // Scrolling up by 1 line means the buffer cell under the same screen pixel is 1 line older
+        assert_eq!(cell0.0, cell1.0 + 1);
+
+        view.terminate();
     }
 
     #[derive(Debug, Default, Clone, Copy)]

@@ -172,6 +172,55 @@ impl Grid {
         }
     }
 
+    /// Returns the row at buffer index `idx` (where 0 is the oldest scrollback line, and scrollback.len() + rows - 1 is the bottom of lines).
+    pub fn buffer_row(&self, idx: usize) -> Option<&Row> {
+        let sb_len = self.scrollback.len();
+        if idx < sb_len {
+            self.scrollback.get(idx)
+        } else {
+            self.lines.get(idx - sb_len)
+        }
+    }
+
+    /// Total number of lines available across scrollback and live screen.
+    pub fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Extract text from the given selection span in buffer coordinates (0 <= buffer_row < total_lines).
+    pub fn extract_text_buffer(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (s, e) = if start <= end { (start, end) } else { (end, start) };
+        let total = self.total_lines();
+        if total == 0 || self.cols == 0 || s.0 >= total {
+            return String::new();
+        }
+
+        let e_row = e.0.min(total - 1);
+        let mut result = Vec::new();
+
+        for r in s.0..=e_row {
+            let row = match self.buffer_row(r) {
+                Some(row) => row,
+                None => continue,
+            };
+            let col_start = if r == s.0 { s.1.min(self.cols - 1) } else { 0 };
+            let col_end = if r == e_row { e.1.min(self.cols - 1) } else { self.cols - 1 };
+
+            if col_start <= col_end {
+                let line_str: String = row[col_start..=col_end]
+                    .iter()
+                    .filter(|c| (c.flags & flags::WIDE_SPACER) == 0)
+                    .map(|c| if c.c == '\0' { ' ' } else { c.c })
+                    .collect();
+                result.push(line_str.trim_end().to_string());
+            } else {
+                result.push(String::new());
+            }
+        }
+
+        result.join("\n")
+    }
+
     /// Plain-text dump of the visible screen (for tests / debugging).
     #[allow(dead_code)]
     pub fn text(&self) -> String {
