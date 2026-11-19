@@ -18,6 +18,7 @@ mod pty;
 mod render;
 mod settings_dialog;
 mod split;
+mod ssh;
 mod tab_group;
 mod term;
 mod theme_manager;
@@ -30,7 +31,57 @@ use tab_group::TabGroup;
 use theme_manager::ThemeManager;
 use widget::TerminalView;
 
+#[derive(Clone, Debug)]
+enum LaunchTarget {
+    Local {
+        cwd: Option<std::path::PathBuf>,
+        title: Option<String>,
+    },
+    SavedSsh {
+        profile: crate::config::SshProfile,
+        pre_ssh_local_dir: Option<std::path::PathBuf>,
+    },
+}
+
+fn show_ssh_error_dialog(parent: &ApplicationWindow, message: &str) {
+    let err_win = gtk4::Window::builder()
+        .title("SSH Connection Error")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(420)
+        .build();
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    vbox.set_margin_start(16);
+    vbox.set_margin_end(16);
+    let msg_label = gtk4::Label::new(Some(message));
+    msg_label.set_wrap(true);
+    msg_label.set_halign(gtk4::Align::Start);
+    let ok_btn = gtk4::Button::with_label("Close");
+    ok_btn.set_halign(gtk4::Align::End);
+    ok_btn.add_css_class("suggested-action");
+    let ew = err_win.downgrade();
+    ok_btn.connect_clicked(move |_| {
+        if let Some(w) = ew.upgrade() {
+            w.close();
+        }
+    });
+    vbox.append(&msg_label);
+    vbox.append(&ok_btn);
+    err_win.set_child(Some(&vbox));
+    err_win.present();
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--ssh-askpass")
+        || (std::env::var_os("WHATTY_SSH_ASKPASS_SOCKET").is_some()
+            && std::env::var_os("WHATTY_SSH_ASKPASS_NONCE").is_some()
+            && std::env::args().len() >= 2)
+    {
+        ssh::run_askpass_client_and_exit();
+    }
+
     // Initialise GTK application
     let app = Application::builder()
         .application_id("io.github.whattytheshell")
@@ -46,10 +97,14 @@ fn main() {
     let theme_manager = ThemeManager::new(&config);
 
     let config_manager = std::rc::Rc::new(std::cell::RefCell::new(config));
+    let askpass_broker = ssh::AskpassBroker::start()
+        .map_err(|e| eprintln!("[Whatty] Failed to start SSH askpass broker: {e}"))
+        .ok();
 
     app.connect_activate(move |app| {
         let config_manager = config_manager.clone();
         let mut theme_manager = theme_manager.clone();
+        let askpass_broker = askpass_broker.clone();
 
         // Register local icon search paths if running from source tree or unpacked directory
         if let Some(display) = gtk4::gdk::Display::default() {
@@ -298,19 +353,44 @@ fn main() {
             device: &std::sync::Arc<wgpu::Device>,
             queue: &std::sync::Arc<wgpu::Queue>,
             config_manager: &std::rc::Rc<std::cell::RefCell<ConfigManager>>,
-            working_dir: Option<&std::path::Path>,
+            askpass_broker: Option<&ssh::AskpassBroker>,
+            window: &ApplicationWindow,
+            target: &LaunchTarget,
         ) -> Result<TerminalView, Box<dyn std::error::Error>> {
-            let (font_family, font_size) = {
+            let (font_family, font_size, default_shell) = {
                 let c = config_manager.borrow();
-                (c.font_family(), c.font_size())
+                (c.font_family(), c.font_size(), c.default_shell())
             };
-            let view = TerminalView::with_working_dir(
-                device.clone(),
-                queue.clone(),
-                font_family,
-                font_size,
-                working_dir,
-            )?;
+            let view = match target {
+                LaunchTarget::Local { cwd, .. } => TerminalView::with_shell_and_working_dir(
+                    device.clone(),
+                    queue.clone(),
+                    font_family,
+                    font_size,
+                    default_shell.as_deref(),
+                    cwd.as_deref(),
+                )?,
+                LaunchTarget::SavedSsh {
+                    profile,
+                    pre_ssh_local_dir,
+                } => {
+                    let broker = askpass_broker.ok_or_else(|| {
+                        std::io::Error::other(
+                            "SSH askpass broker is unavailable (failed to bind runtime socket).",
+                        )
+                    })?;
+                    TerminalView::with_ssh_profile(
+                        device.clone(),
+                        queue.clone(),
+                        font_family,
+                        font_size,
+                        profile,
+                        broker,
+                        window,
+                        pre_ssh_local_dir.clone(),
+                    )?
+                }
+            };
 
             if let Some(ref colors) = config_manager.borrow().theme_colors() {
                 let palette = crate::render::pipeline::palette_from_vscode_colors(colors);
@@ -418,7 +498,7 @@ fn main() {
         }
 
         type CreateTabFn = std::rc::Rc<
-            dyn Fn(&gtk4::Notebook, &ApplicationWindow, Option<&std::path::Path>, Option<&str>),
+            dyn Fn(&gtk4::Notebook, &ApplicationWindow, LaunchTarget),
         >;
 
         let create_tab_cell: std::rc::Rc<std::cell::RefCell<Option<CreateTabFn>>> =
@@ -435,6 +515,7 @@ fn main() {
             let queue_clone = queue.clone();
             let cfg_clone = config_manager.clone();
             let active_terminal_split = active_terminal.clone();
+            let broker_split = askpass_broker.clone();
             std::rc::Rc::new(
                 move |notebook: &gtk4::Notebook,
                       window: &ApplicationWindow,
@@ -449,6 +530,10 @@ fn main() {
                         None => return false,
                     };
 
+                    if split::find_terminals(&page_widget).len() >= split::MAX_PANES_PER_TAB {
+                        return false;
+                    }
+
                     let active_opt = active_terminal_split.try_borrow().ok().and_then(|g| g.clone());
                     let target_view = match target {
                         Some(t) => t.clone(),
@@ -458,11 +543,44 @@ fn main() {
                         },
                     };
 
-                    let cwd = target_view.current_working_dir();
-                    let new_view = match create_terminal_view(&device_clone, &queue_clone, &cfg_clone, cwd.as_deref()) {
+                    let split_target = match target_view.session_origin() {
+                        widget::SessionOrigin::Local => LaunchTarget::Local {
+                            cwd: target_view.current_working_dir(),
+                            title: None,
+                        },
+                        widget::SessionOrigin::SavedSsh {
+                            profile_id,
+                            pre_ssh_local_dir,
+                            ..
+                        } => match cfg_clone.borrow().get_ssh_profile(&profile_id) {
+                            Some(profile) => LaunchTarget::SavedSsh {
+                                profile,
+                                pre_ssh_local_dir,
+                            },
+                            None => LaunchTarget::Local {
+                                cwd: pre_ssh_local_dir,
+                                title: None,
+                            },
+                        },
+                    };
+
+                    let new_view = match create_terminal_view(
+                        &device_clone,
+                        &queue_clone,
+                        &cfg_clone,
+                        broker_split.as_ref(),
+                        window,
+                        &split_target,
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             eprintln!("Failed to create split terminal view: {e}");
+                            if matches!(split_target, LaunchTarget::SavedSsh { .. }) {
+                                show_ssh_error_dialog(
+                                    window,
+                                    &format!("Failed to start SSH split pane: {e}"),
+                                );
+                            }
                             return false;
                         }
                     };
@@ -512,18 +630,34 @@ fn main() {
             let tab_scroll_accum = tab_scroll_accum.clone();
             let do_split_cb = do_split.clone();
             let active_terminal_for_tab = active_terminal.clone();
+            let broker_for_tab = askpass_broker.clone();
 
             std::rc::Rc::new(
                 move |notebook: &gtk4::Notebook,
                       window: &ApplicationWindow,
-                      working_dir: Option<&std::path::Path>,
-                      title: Option<&str>| {
-                    if let Ok(view) = create_terminal_view(
+                      target: LaunchTarget| {
+                    let view = match create_terminal_view(
                         &device_clone,
                         &queue_clone,
                         &cfg_for_tab,
-                        working_dir,
+                        broker_for_tab.as_ref(),
+                        window,
+                        &target,
                     ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Failed to create terminal view: {e}");
+                            if matches!(target, LaunchTarget::SavedSsh { .. }) {
+                                show_ssh_error_dialog(
+                                    window,
+                                    &format!("Failed to launch SSH session: {e}"),
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    let cfg_for_dup = cfg_for_tab.clone();
+                    {
                         let active_term_initial = active_terminal_for_tab.clone();
                         let v_initial_weak = view.downgrade();
                         let focus_ctrl = gtk4::EventControllerFocus::new();
@@ -539,36 +673,44 @@ fn main() {
                             *slot = Some(view.clone());
                         }
 
-                        let initial_cwd = view.current_working_dir()
-                            .or_else(|| working_dir.map(|p| p.to_path_buf()))
-                            .or_else(|| std::env::current_dir().ok());
+                        let custom_title_arg = match &target {
+                            LaunchTarget::Local { title, .. } => title.clone(),
+                            LaunchTarget::SavedSsh { .. } => None,
+                        };
+                        let fallback_dir = match &target {
+                            LaunchTarget::Local { cwd, .. } => cwd.clone(),
+                            LaunchTarget::SavedSsh {
+                                pre_ssh_local_dir, ..
+                            } => pre_ssh_local_dir.clone(),
+                        };
+                        let initial_auto = view.auto_tab_title().or_else(|| {
+                            let cwd = fallback_dir.or_else(|| std::env::current_dir().ok());
+                            cwd.map(|p| (format_dir_path(&p), p.to_string_lossy().into_owned()))
+                        });
 
-                        let (tab_title, is_custom) = match title {
-                            Some(t) => (truncate_middle(t, 32), true),
-                            None => {
-                                let formatted = initial_cwd
-                                    .as_ref()
-                                    .map(|p| format_dir_path(p))
-                                    .unwrap_or_else(|| "~".to_string());
-                                (formatted, false)
-                            }
+                        let (tab_title, tab_tooltip, is_custom) = match custom_title_arg {
+                            Some(ref t) => (truncate_middle(t, 32), Some(t.clone()), true),
+                            None => match &initial_auto {
+                                Some((title_text, tip)) => {
+                                    (truncate_middle(title_text, 32), Some(tip.clone()), false)
+                                }
+                                None => ("~".to_string(), None, false),
+                            },
                         };
 
                         if is_custom {
-                            view.set_custom_title(title.map(|t| t.to_string()));
+                            view.set_custom_title(custom_title_arg);
                         } else {
                             view.set_custom_title(None);
                         }
 
-                        let last_seen_cwd = std::rc::Rc::new(std::cell::RefCell::new(initial_cwd.clone()));
+                        let last_seen_cwd = std::rc::Rc::new(std::cell::RefCell::new(initial_auto));
 
                         let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
 
                         let label = gtk4::Label::new(Some(&tab_title));
-                        if is_custom {
-                            label.set_tooltip_text(title.as_deref().or(Some(&tab_title)));
-                        } else if let Some(ref cwd) = initial_cwd {
-                            label.set_tooltip_text(Some(&cwd.to_string_lossy()));
+                        if let Some(ref tip) = tab_tooltip {
+                            label.set_tooltip_text(Some(tip));
                         }
                         tab_box.append(&label);
 
@@ -679,13 +821,11 @@ fn main() {
                                         } else {
                                             view.set_custom_title(None);
                                             *last_seen_for_commit.borrow_mut() = None;
-                                            let cwd = view.current_working_dir()
-                                                .or_else(|| std::env::current_dir().ok());
-                                            if let Some(ref path) = cwd {
-                                                *last_seen_for_commit.borrow_mut() = Some(path.clone());
-                                                let formatted = format_dir_path(path);
-                                                label.set_text(&formatted);
-                                                label.set_tooltip_text(Some(&path.to_string_lossy()));
+                                            if let Some((title_text, tip)) = view.auto_tab_title() {
+                                                *last_seen_for_commit.borrow_mut() =
+                                                    Some((title_text.clone(), tip.clone()));
+                                                label.set_text(&truncate_middle(&title_text, 32));
+                                                label.set_tooltip_text(Some(&tip));
                                             }
                                         }
                                         rename_popover.popdown();
@@ -773,13 +913,11 @@ fn main() {
                             if let (Some(view_for_restore), Some(label_for_restore)) = (view_for_restore.upgrade(), label_for_restore.upgrade()) {
                                 view_for_restore.set_custom_title(None);
                                 *last_seen_for_restore.borrow_mut() = None;
-                                let cwd = view_for_restore.current_working_dir()
-                                    .or_else(|| std::env::current_dir().ok());
-                                if let Some(ref path) = cwd {
-                                    *last_seen_for_restore.borrow_mut() = Some(path.clone());
-                                    let formatted = format_dir_path(path);
-                                    label_for_restore.set_text(&formatted);
-                                    label_for_restore.set_tooltip_text(Some(&path.to_string_lossy()));
+                                if let Some((title_text, tip)) = view_for_restore.auto_tab_title() {
+                                    *last_seen_for_restore.borrow_mut() =
+                                        Some((title_text.clone(), tip.clone()));
+                                    label_for_restore.set_text(&truncate_middle(&title_text, 32));
+                                    label_for_restore.set_tooltip_text(Some(&tip));
                                 }
                                 view_for_restore.grab_focus();
                             }
@@ -794,15 +932,38 @@ fn main() {
                         let view_for_dup = view.downgrade();
                         let create_tab_cell_dup = create_tab_cell.clone();
                         let label_for_dup = label.downgrade();
+                        let cfg_dup_click = cfg_for_dup.clone();
                         dup_btn.connect_clicked(move |_| {
                             if let Some(pop) = pop_dup.upgrade() {
                                 pop.popdown();
                             }
                             if let (Some(view_for_dup), Some(label_for_dup)) = (view_for_dup.upgrade(), label_for_dup.upgrade()) {
-                                let cwd = view_for_dup.current_working_dir();
-                                let dup_title = format!("{} (cópia)", label_for_dup.text());
+                                let dup_target = match view_for_dup.session_origin() {
+                                    widget::SessionOrigin::Local => {
+                                        let cwd = view_for_dup.current_working_dir();
+                                        let dup_title = format!("{} (cópia)", label_for_dup.text());
+                                        LaunchTarget::Local {
+                                            cwd,
+                                            title: Some(dup_title),
+                                        }
+                                    }
+                                    widget::SessionOrigin::SavedSsh {
+                                        profile_id,
+                                        pre_ssh_local_dir,
+                                        ..
+                                    } => match cfg_dup_click.borrow().get_ssh_profile(&profile_id) {
+                                        Some(profile) => LaunchTarget::SavedSsh {
+                                            profile,
+                                            pre_ssh_local_dir,
+                                        },
+                                        None => LaunchTarget::Local {
+                                            cwd: pre_ssh_local_dir,
+                                            title: None,
+                                        },
+                                    },
+                                };
                                 if let Some(ref cb) = *create_tab_cell_dup.borrow() {
-                                    cb(&nb_for_dup, &win_for_dup, cwd.as_deref(), Some(&dup_title));
+                                    cb(&nb_for_dup, &win_for_dup, dup_target);
                                 }
                             }
                         });
@@ -1194,7 +1355,8 @@ fn main() {
                         });
                         tab_box.add_controller(tab_scroll);
 
-                        let idx = notebook.append_page(&view, Some(&tab_box));
+                        let idx = notebook.append_page(&view, None::<&gtk4::Widget>);
+                        notebook.set_tab_label(&view, Some(&tab_box));
                         notebook.set_tab_reorderable(&view, true);
                         notebook.set_current_page(Some(idx));
 
@@ -1235,13 +1397,13 @@ fn main() {
 
                             if let Some(v) = cur_view {
                                 if v.custom_title().is_none() {
-                                    if let Some(cwd) = v.current_working_dir() {
+                                    if let Some((title_text, tip)) = v.auto_tab_title() {
+                                        let next_pair = (title_text.clone(), tip.clone());
                                         let mut last = last_seen_for_auto.borrow_mut();
-                                        if last.as_ref() != Some(&cwd) {
-                                            *last = Some(cwd.clone());
-                                            let title = format_dir_path(&cwd);
-                                            label_for_auto.set_text(&title);
-                                            label_for_auto.set_tooltip_text(Some(&cwd.to_string_lossy()));
+                                        if last.as_ref() != Some(&next_pair) {
+                                            *last = Some(next_pair);
+                                            label_for_auto.set_text(&truncate_middle(&title_text, 32));
+                                            label_for_auto.set_tooltip_text(Some(&tip));
                                         }
                                     }
                                 }
@@ -1259,16 +1421,25 @@ fn main() {
         // Restore saved tabs or create the primary terminal view
         let saved_tabs = config_manager.borrow().open_tabs();
         if saved_tabs.is_empty() {
-            create_tab(tab_group.widget(), &window, None, None);
+            create_tab(
+                tab_group.widget(),
+                &window,
+                LaunchTarget::Local {
+                    cwd: None,
+                    title: None,
+                },
+            );
         } else {
             for tab in saved_tabs {
-                let cwd = tab.working_dir.as_deref();
-                let title = if tab.custom_title {
-                    tab.title.as_deref()
-                } else {
-                    None
-                };
-                create_tab(tab_group.widget(), &window, cwd, title);
+                let title = if tab.custom_title { tab.title } else { None };
+                create_tab(
+                    tab_group.widget(),
+                    &window,
+                    LaunchTarget::Local {
+                        cwd: tab.working_dir,
+                        title,
+                    },
+                );
             }
         }
 
@@ -1294,8 +1465,10 @@ fn main() {
             create_tab_action(
                 &nb_clone_for_action,
                 &win_clone_for_action,
-                active_cwd.as_deref(),
-                None,
+                LaunchTarget::Local {
+                    cwd: active_cwd,
+                    title: None,
+                },
             );
         });
         window.add_action(&new_tab_action);
@@ -1444,6 +1617,50 @@ fn main() {
         window.add_action(&preferences_action);
         app.set_accels_for_action("win.preferences", &["<Ctrl>comma"]);
 
+        // Launch Saved SSH Profile Action
+        let launch_ssh_action = gtk4::gio::SimpleAction::new(
+            "launch-ssh-profile",
+            Some(gtk4::glib::VariantTy::STRING),
+        );
+        let nb_for_ssh = tab_group.widget().clone();
+        let win_for_ssh = window.clone();
+        let cfg_for_ssh = config_manager.clone();
+        let create_tab_ssh = create_tab.clone();
+        let active_term_ssh = active_terminal.clone();
+        launch_ssh_action.connect_activate(move |_, param| {
+            let Some(profile_id) = param.and_then(|v| v.str()) else {
+                return;
+            };
+            let profile = match cfg_for_ssh.borrow().get_ssh_profile(profile_id) {
+                Some(p) => p,
+                None => {
+                    show_ssh_error_dialog(
+                        &win_for_ssh,
+                        &format!("Saved SSH profile '{profile_id}' was not found."),
+                    );
+                    return;
+                }
+            };
+            let active_opt = active_term_ssh.try_borrow().ok().and_then(|g| g.clone());
+            let pre_ssh_local_dir = nb_for_ssh
+                .current_page()
+                .and_then(|p| nb_for_ssh.nth_page(Some(p)))
+                .and_then(|page| {
+                    split::find_focused_terminal_with_active(&page, active_opt.as_ref())
+                        .or_else(|| split::find_terminals(&page).into_iter().next())
+                })
+                .and_then(|v| v.current_working_dir());
+            create_tab_ssh(
+                &nb_for_ssh,
+                &win_for_ssh,
+                LaunchTarget::SavedSsh {
+                    profile,
+                    pre_ssh_local_dir,
+                },
+            );
+        });
+        window.add_action(&launch_ssh_action);
+
         // Save open tabs on window close
         let nb_for_close = tab_group.widget().clone();
         let cfg_for_close = config_manager.clone();
@@ -1566,7 +1783,14 @@ fn main() {
                 let n_pages = nb_for_new_tab.n_pages();
                 if n_pages == 0 {
                     gesture.set_state(gtk4::EventSequenceState::Claimed);
-                    create_tab_for_nb_click(&nb_for_new_tab, &win_for_new_tab, None, None);
+                    create_tab_for_nb_click(
+                        &nb_for_new_tab,
+                        &win_for_new_tab,
+                        LaunchTarget::Local {
+                            cwd: None,
+                            title: None,
+                        },
+                    );
                     return;
                 }
 
@@ -1626,8 +1850,10 @@ fn main() {
                         create_tab_for_nb_click(
                             &nb_for_new_tab,
                             &win_for_new_tab,
-                            active_cwd.as_deref(),
-                            None,
+                            LaunchTarget::Local {
+                                cwd: active_cwd,
+                                title: None,
+                            },
                         );
                     }
                 }
@@ -1734,6 +1960,99 @@ fn main() {
         menu.append(Some("Sair"), Some("app.quit"));
         menu_button.set_menu_model(Some(&menu));
         header_bar.pack_end(&menu_button);
+
+        let ssh_menu_button = gtk4::MenuButton::new();
+        ssh_menu_button.set_icon_name("network-server-symbolic");
+        ssh_menu_button.set_tooltip_text(Some("Saved SSH Sessions"));
+        ssh_menu_button.set_can_focus(false);
+        let ssh_popover = gtk4::Popover::new();
+        let cfg_for_ssh_menu = config_manager.clone();
+        let win_for_ssh_menu = window.clone();
+        ssh_popover.connect_show(move |pop| {
+            let profiles = cfg_for_ssh_menu.borrow().ssh_profiles();
+            let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            outer.set_margin_top(6);
+            outer.set_margin_bottom(6);
+            outer.set_margin_start(6);
+            outer.set_margin_end(6);
+
+            if profiles.is_empty() {
+                let empty_btn = gtk4::Button::with_label("No saved profiles — open Preferences");
+                empty_btn.add_css_class("flat");
+                let pop_w = pop.downgrade();
+                let win_w = win_for_ssh_menu.downgrade();
+                empty_btn.connect_clicked(move |_| {
+                    if let Some(p) = pop_w.upgrade() {
+                        p.popdown();
+                    }
+                    if let Some(w) = win_w.upgrade() {
+                        let _ = gtk4::prelude::WidgetExt::activate_action(&w, "win.preferences", None);
+                    }
+                });
+                outer.append(&empty_btn);
+            } else {
+                let list_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+                for prof in &profiles {
+                    let target_desc = match prof.user.as_deref() {
+                        Some(u) if !u.is_empty() => format!("{} ({u}@{})", prof.name, prof.host),
+                        _ => format!("{} ({})", prof.name, prof.host),
+                    };
+                    let btn = gtk4::Button::with_label(&target_desc);
+                    btn.add_css_class("flat");
+                    if let Some(child) = btn.child()
+                        && let Ok(lbl) = child.downcast::<gtk4::Label>()
+                    {
+                        lbl.set_halign(gtk4::Align::Start);
+                    }
+                    let pop_w = pop.downgrade();
+                    let win_w = win_for_ssh_menu.downgrade();
+                    let prof_id = prof.id.clone();
+                    btn.connect_clicked(move |_| {
+                        if let Some(p) = pop_w.upgrade() {
+                            p.popdown();
+                        }
+                        if let Some(w) = win_w.upgrade() {
+                            let _ = gtk4::prelude::WidgetExt::activate_action(
+                                &w,
+                                "win.launch-ssh-profile",
+                                Some(&prof_id.to_variant()),
+                            );
+                        }
+                    });
+                    list_box.append(&btn);
+                }
+
+                if profiles.len() > 12 {
+                    let scroll = gtk4::ScrolledWindow::new();
+                    scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+                    scroll.set_min_content_height(320);
+                    scroll.set_max_content_height(360);
+                    scroll.set_child(Some(&list_box));
+                    outer.append(&scroll);
+                } else {
+                    outer.append(&list_box);
+                }
+
+                outer.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+                let manage_btn = gtk4::Button::with_label("Manage SSH Sessions...");
+                manage_btn.add_css_class("flat");
+                let pop_w = pop.downgrade();
+                let win_w = win_for_ssh_menu.downgrade();
+                manage_btn.connect_clicked(move |_| {
+                    if let Some(p) = pop_w.upgrade() {
+                        p.popdown();
+                    }
+                    if let Some(w) = win_w.upgrade() {
+                        let _ = gtk4::prelude::WidgetExt::activate_action(&w, "win.preferences", None);
+                    }
+                });
+                outer.append(&manage_btn);
+            }
+
+            pop.set_child(Some(&outer));
+        });
+        ssh_menu_button.set_popover(Some(&ssh_popover));
+        header_bar.pack_end(&ssh_menu_button);
 
         // Window layout (no double titlebar)
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);

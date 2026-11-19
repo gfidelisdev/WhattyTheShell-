@@ -378,14 +378,10 @@ mod tests {
 
     #[test]
     fn test_split_and_close_panes() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                eprintln!("GTK already initialized on another thread, skipping");
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match crate::widget::tests::lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
         let (dev, queue) = match setup_device_queue() {
             Some(dq) => dq,
             None => return,
@@ -452,13 +448,10 @@ mod tests {
 
     #[test]
     fn test_split_4_horizontal_and_unsplit() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match crate::widget::tests::lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
         let (dev, queue) = match setup_device_queue() {
             Some(dq) => dq,
             None => return,
@@ -494,13 +487,10 @@ mod tests {
 
     #[test]
     fn test_split_4_vertical() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match crate::widget::tests::lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
         let (dev, queue) = match setup_device_queue() {
             Some(dq) => dq,
             None => return,
@@ -525,13 +515,10 @@ mod tests {
 
     #[test]
     fn test_close_pane_and_close_tab_with_real_tab_box() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match crate::widget::tests::lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
         let (dev, queue) = match setup_device_queue() {
             Some(dq) => dq,
             None => return,
@@ -575,14 +562,10 @@ mod tests {
 
     #[test]
     fn test_merge_tabs() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                eprintln!("GTK already initialized on another thread, skipping");
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match crate::widget::tests::lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
         let (dev, queue) = match setup_device_queue() {
             Some(dq) => dq,
             None => return,

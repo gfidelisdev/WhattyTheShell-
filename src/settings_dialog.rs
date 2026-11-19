@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Align, ApplicationWindow, Box as GtkBox, Button, CheckButton, DrawingArea,
+    glib, Align, ApplicationWindow, Box as GtkBox, Button, CheckButton, DrawingArea, DropDown,
     Entry, Frame, GestureClick, Image, Label, ListBox, ListBoxRow, Notebook, Orientation,
-    ProgressBar, Scale, ScrolledWindow, SearchEntry, SpinButton, Stack, StackSwitcher,
-    Switch, Window,
+    PasswordEntry, ProgressBar, Scale, ScrolledWindow, SearchEntry, SpinButton, Stack,
+    StackSwitcher, Switch, Window,
 };
 
 use crate::render::pipeline::{hex_to_rgba, palette_from_vscode_colors, Palette};
@@ -16,6 +16,16 @@ use crate::theme_marketplace::{
     DownloadProgress, Extension,
 };
 use crate::widget::TerminalView;
+
+fn for_each_terminal<F: FnMut(&TerminalView)>(nb: &Notebook, mut f: F) {
+    for i in 0..nb.n_pages() {
+        if let Some(page) = nb.nth_page(Some(i)) {
+            for tv in crate::split::find_terminals(&page) {
+                f(&tv);
+            }
+        }
+    }
+}
 
 fn create_swatches_widget(swatches: &[String], width: i32, height: i32) -> DrawingArea {
     let area = DrawingArea::builder()
@@ -541,14 +551,9 @@ pub fn open_settings_dialog(
 
         cfg_for_font.borrow_mut().set_font(new_family.clone(), new_size);
 
-        let n_pages = nb_for_font.n_pages();
-        for i in 0..n_pages {
-            if let Some(page) = nb_for_font.nth_page(Some(i)) {
-                if let Ok(view) = page.downcast::<TerminalView>() {
-                    view.set_font(new_family.clone(), new_size);
-                }
-            }
-        }
+        for_each_terminal(&nb_for_font, |view| {
+            view.set_font(new_family.clone(), new_size);
+        });
     };
 
     let af_btn = apply_font_action.clone();
@@ -630,14 +635,9 @@ pub fn open_settings_dialog(
             palette.cursor = c;
         }
 
-        let n_pages = nb_for_colors.n_pages();
-        for i in 0..n_pages {
-            if let Some(page) = nb_for_colors.nth_page(Some(i)) {
-                if let Ok(view) = page.downcast::<TerminalView>() {
-                    view.set_palette(palette.clone());
-                }
-            }
-        }
+        for_each_terminal(&nb_for_colors, |view| {
+            view.set_palette(palette.clone());
+        });
 
         let mut tm = tm_for_colors.borrow_mut();
         tm.apply_palette(&map);
@@ -944,14 +944,9 @@ pub fn open_settings_dialog(
                 cfg_for_theme.borrow_mut().set_theme(theme_name, colors.clone());
 
                 let palette = palette_from_vscode_colors(&colors);
-                let n_pages = nb_cl.n_pages();
-                for i in 0..n_pages {
-                    if let Some(page) = nb_cl.nth_page(Some(i)) {
-                        if let Ok(view) = page.downcast::<TerminalView>() {
-                            view.set_palette(palette.clone());
-                        }
-                    }
-                }
+                for_each_terminal(&nb_cl, |view| {
+                    view.set_palette(palette.clone());
+                });
                 dlg_cl.close();
             }
         });
@@ -1150,6 +1145,71 @@ pub fn open_settings_dialog(
     let tabs_box = GtkBox::new(Orientation::Vertical, 16);
     tabs_box.set_margin_top(12);
 
+    // Section 0: Default Shell
+    let shell_section_title = Label::new(Some("Default Shell"));
+    shell_section_title.set_halign(Align::Start);
+    shell_section_title.add_css_class("heading");
+    tabs_box.append(&shell_section_title);
+
+    let shell_row = GtkBox::new(Orientation::Horizontal, 12);
+    let shell_label_box = GtkBox::new(Orientation::Vertical, 2);
+    shell_label_box.set_hexpand(true);
+    let shell_title = Label::new(Some("Shell for new terminals"));
+    shell_title.set_halign(Align::Start);
+    let shell_desc = Label::new(Some("Choose which installed shell to launch in new tabs and split panes"));
+    shell_desc.set_halign(Align::Start);
+    shell_desc.add_css_class("dim-label");
+    shell_label_box.append(&shell_title);
+    shell_label_box.append(&shell_desc);
+
+    let mut shell_labels: Vec<String> = Vec::new();
+    let mut shell_values: Vec<Option<String>> = Vec::new();
+
+    let system_default_label = match std::env::var("SHELL") {
+        Ok(env_sh) if !env_sh.trim().is_empty() => format!("System Default ({})", env_sh.trim()),
+        _ => "System Default ($SHELL)".to_string(),
+    };
+    shell_labels.push(system_default_label);
+    shell_values.push(None);
+
+    for sh in crate::pty::discover_installed_shells() {
+        shell_labels.push(format!("{} ({})", sh.name, sh.path));
+        shell_values.push(Some(sh.path));
+    }
+
+    let current_shell = config_manager.borrow().default_shell();
+    if let Some(ref saved) = current_shell {
+        if !shell_values.iter().any(|v| v.as_deref() == Some(saved.as_str())) {
+            shell_labels.push(format!("{} (custom)", saved));
+            shell_values.push(Some(saved.clone()));
+        }
+    }
+
+    let label_refs: Vec<&str> = shell_labels.iter().map(String::as_str).collect();
+    let shell_dropdown = DropDown::from_strings(&label_refs);
+    shell_dropdown.set_valign(Align::Center);
+
+    let initial_shell_idx = current_shell
+        .as_deref()
+        .and_then(|saved| {
+            shell_values
+                .iter()
+                .position(|v| v.as_deref() == Some(saved))
+        })
+        .unwrap_or(0);
+    shell_dropdown.set_selected(initial_shell_idx as u32);
+
+    let cfg_for_shell = config_manager.clone();
+    shell_dropdown.connect_selected_notify(move |dd| {
+        let idx = dd.selected() as usize;
+        let selected_shell = shell_values.get(idx).cloned().flatten();
+        cfg_for_shell.borrow_mut().set_default_shell(selected_shell);
+    });
+
+    shell_row.append(&shell_label_box);
+    shell_row.append(&shell_dropdown);
+    tabs_box.append(&shell_row);
+
     // Section 1: Navigation & Tabs
     let tab_section_title = Label::new(Some("Tabs & Layout"));
     tab_section_title.set_halign(Align::Start);
@@ -1296,13 +1356,9 @@ pub fn open_settings_dialog(
         if pct > 100 && experimental {
             val_label_clone.set_text(&format!("{}% (Supersaturado)", pct));
             win_for_scale.set_opacity(1.0);
-            for i in 0..nb_for_scale.n_pages() {
-                if let Some(page) = nb_for_scale.nth_page(Some(i)) {
-                    if let Ok(tv) = page.downcast::<TerminalView>() {
-                        tv.set_saturation_boost(factor);
-                    }
-                }
-            }
+            for_each_terminal(&nb_for_scale, |tv| {
+                tv.set_saturation_boost(factor);
+            });
             let mut c = cfg_for_scale.borrow_mut();
             c.set_window_opacity(1.0);
             c.set_color_saturation(factor);
@@ -1310,13 +1366,9 @@ pub fn open_settings_dialog(
             val_label_clone.set_text(&format!("{}%", pct));
             let opacity = (factor.min(1.0)).max(0.20);
             win_for_scale.set_opacity(opacity as f64);
-            for i in 0..nb_for_scale.n_pages() {
-                if let Some(page) = nb_for_scale.nth_page(Some(i)) {
-                    if let Ok(tv) = page.downcast::<TerminalView>() {
-                        tv.set_saturation_boost(1.0);
-                    }
-                }
-            }
+            for_each_terminal(&nb_for_scale, |tv| {
+                tv.set_saturation_boost(1.0);
+            });
             let mut c = cfg_for_scale.borrow_mut();
             c.set_window_opacity(opacity);
             c.set_color_saturation(1.0);
@@ -1339,13 +1391,9 @@ pub fn open_settings_dialog(
                 scale_for_exp.set_value(100.0);
                 val_label_exp.set_text("100%");
                 win_for_exp.set_opacity(1.0);
-                for i in 0..nb_for_exp.n_pages() {
-                    if let Some(page) = nb_for_exp.nth_page(Some(i)) {
-                        if let Ok(tv) = page.downcast::<TerminalView>() {
-                            tv.set_saturation_boost(1.0);
-                        }
-                    }
-                }
+                for_each_terminal(&nb_for_exp, |tv| {
+                    tv.set_saturation_boost(1.0);
+                });
                 let mut c = cfg_for_exp.borrow_mut();
                 c.set_window_opacity(1.0);
                 c.set_color_saturation(1.0);
@@ -1358,7 +1406,844 @@ pub fn open_settings_dialog(
 
     stack.add_titled(&tabs_box, Some("layout"), "Window & Tabs");
 
+    // ==========================================
+    // TAB 4: SSH Sessions (Profiles & Keyring)
+    // ==========================================
+    let ssh_box = build_ssh_sessions_tab(parent, &dialog, config_manager.clone());
+    stack.add_titled(&ssh_box, Some("ssh_sessions"), "SSH Sessions");
+
     root_box.append(&stack);
     dialog.set_child(Some(&root_box));
     dialog.present();
+}
+
+#[derive(Clone)]
+struct SshFormWidgets {
+    list_box: ListBox,
+    displayed_ids: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    selected_id: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    loaded_auth_kind: std::rc::Rc<std::cell::RefCell<Option<crate::config::SshAuthKind>>>,
+    loading: std::rc::Rc<std::cell::Cell<bool>>,
+    in_flight: std::rc::Rc<std::cell::Cell<bool>>,
+    name_entry: Entry,
+    host_entry: Entry,
+    user_entry: Entry,
+    port_entry: Entry,
+    auth_dropdown: DropDown,
+    identity_row: GtkBox,
+    identity_entry: Entry,
+    secret_row: GtkBox,
+    secret_label: Label,
+    secret_entry: PasswordEntry,
+    clear_secret_btn: Button,
+    mux_dropdown: DropDown,
+    cm_switch: Switch,
+    bypass_switch: Switch,
+    status_label: Label,
+    new_btn: Button,
+    save_btn: Button,
+    delete_btn: Button,
+    connect_btn: Button,
+    config_manager: std::rc::Rc<std::cell::RefCell<crate::config::ConfigManager>>,
+    parent_window: ApplicationWindow,
+    dialog_window: Window,
+}
+
+impl SshFormWidgets {
+    fn selected_auth_kind(&self) -> crate::config::SshAuthKind {
+        match self.auth_dropdown.selected() {
+            1 => crate::config::SshAuthKind::IdentityFile,
+            2 => crate::config::SshAuthKind::PasswordKeyring,
+            _ => crate::config::SshAuthKind::AgentOrDefault,
+        }
+    }
+
+    fn set_status(&self, msg: &str, is_error: bool) {
+        self.status_label.remove_css_class("error");
+        if is_error {
+            self.status_label.add_css_class("error");
+        }
+        self.status_label.set_text(msg);
+    }
+
+    fn refresh_auth_fields(&self) {
+        let auth = self.selected_auth_kind();
+        let is_existing = self.selected_id.borrow().is_some();
+        let is_identity = auth == crate::config::SshAuthKind::IdentityFile;
+        let uses_secret = auth != crate::config::SshAuthKind::AgentOrDefault;
+
+        self.identity_row.set_sensitive(is_identity);
+        self.identity_entry.set_sensitive(is_identity);
+        self.secret_row.set_sensitive(uses_secret);
+        self.secret_entry.set_sensitive(uses_secret);
+
+        let label_text = match auth {
+            crate::config::SshAuthKind::IdentityFile => "Key Passphrase (optional, Keyring)",
+            crate::config::SshAuthKind::PasswordKeyring => "SSH Password (System Keyring)",
+            crate::config::SshAuthKind::AgentOrDefault => "Secret (Not used for Agent/Default)",
+        };
+        self.secret_label.set_text(label_text);
+
+        let placeholder = if !uses_secret {
+            "Not used with SSH Agent / Default Keys"
+        } else if is_existing {
+            "Leave blank to keep existing secret"
+        } else if is_identity {
+            "Enter passphrase or leave blank for prompt"
+        } else {
+            "Enter password or leave blank for prompt"
+        };
+        self.secret_entry
+            .set_property("placeholder-text", placeholder);
+
+        let busy = self.in_flight.get();
+        self.clear_secret_btn
+            .set_sensitive(!busy && is_existing && uses_secret);
+        self.delete_btn.set_sensitive(!busy && is_existing);
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.in_flight.set(busy);
+        self.new_btn.set_sensitive(!busy);
+        self.save_btn.set_sensitive(!busy);
+        self.connect_btn.set_sensitive(!busy);
+        self.refresh_auth_fields();
+    }
+
+    fn load_new_profile(&self) {
+        self.loading.set(true);
+        self.list_box.unselect_all();
+        *self.selected_id.borrow_mut() = None;
+        *self.loaded_auth_kind.borrow_mut() = None;
+
+        self.name_entry.set_text("");
+        self.host_entry.set_text("");
+        self.user_entry.set_text("");
+        self.port_entry.set_text("");
+        self.auth_dropdown.set_selected(0);
+        self.identity_entry.set_text("");
+        self.secret_entry.set_text("");
+        self.mux_dropdown.set_selected(0);
+        self.cm_switch.set_active(false);
+        self.bypass_switch.set_active(false);
+        self.set_status("", false);
+
+        self.loading.set(false);
+        self.refresh_auth_fields();
+    }
+
+    fn load_profile(&self, p: &crate::config::SshProfile) {
+        self.loading.set(true);
+        *self.selected_id.borrow_mut() = Some(p.id.clone());
+        *self.loaded_auth_kind.borrow_mut() = Some(p.auth_kind);
+
+        self.name_entry.set_text(&p.name);
+        self.host_entry.set_text(&p.host);
+        self.user_entry.set_text(p.user.as_deref().unwrap_or(""));
+        self.port_entry
+            .set_text(&p.port.map(|v| v.to_string()).unwrap_or_default());
+
+        let auth_idx = match p.auth_kind {
+            crate::config::SshAuthKind::AgentOrDefault => 0,
+            crate::config::SshAuthKind::IdentityFile => 1,
+            crate::config::SshAuthKind::PasswordKeyring => 2,
+        };
+        self.auth_dropdown.set_selected(auth_idx);
+
+        let ident = p
+            .identity_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.identity_entry.set_text(&ident);
+        self.secret_entry.set_text("");
+
+        let first_mux = p
+            .multiplexer_priority
+            .iter()
+            .copied()
+            .find(|m| *m != crate::config::MultiplexerKind::Unknown)
+            .unwrap_or(crate::config::MultiplexerKind::Tmux);
+        let mux_idx = if first_mux == crate::config::MultiplexerKind::Screen {
+            1
+        } else {
+            0
+        };
+        self.mux_dropdown.set_selected(mux_idx);
+        self.cm_switch.set_active(p.use_control_master);
+        self.bypass_switch.set_active(p.bypass_multiplexer_probe);
+        self.set_status("", false);
+
+        self.loading.set(false);
+        self.refresh_auth_fields();
+    }
+
+    fn reload_list(&self, select_id: Option<&str>) {
+        self.loading.set(true);
+        while let Some(child) = self.list_box.first_child() {
+            self.list_box.remove(&child);
+        }
+
+        let profiles = self.config_manager.borrow().ssh_profiles();
+        let mut ids = Vec::with_capacity(profiles.len());
+        let mut row_to_select: Option<ListBoxRow> = None;
+
+        for p in &profiles {
+            ids.push(p.id.clone());
+
+            let row_box = GtkBox::new(Orientation::Vertical, 2);
+            row_box.set_margin_top(6);
+            row_box.set_margin_bottom(6);
+            row_box.set_margin_start(8);
+            row_box.set_margin_end(8);
+
+            let title = Label::new(Some(&p.name));
+            title.set_halign(Align::Start);
+            title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+            let subtitle_text = format_ssh_target(p);
+            let subtitle = Label::new(Some(&subtitle_text));
+            subtitle.set_halign(Align::Start);
+            subtitle.add_css_class("dim-label");
+            subtitle.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+            row_box.append(&title);
+            row_box.append(&subtitle);
+
+            let row = ListBoxRow::new();
+            row.set_child(Some(&row_box));
+            self.list_box.append(&row);
+
+            if select_id == Some(p.id.as_str()) {
+                row_to_select = Some(row);
+            }
+        }
+
+        *self.displayed_ids.borrow_mut() = ids;
+        if let Some(row) = row_to_select {
+            self.list_box.select_row(Some(&row));
+        } else {
+            self.list_box.unselect_all();
+        }
+        self.loading.set(false);
+    }
+
+    fn collect_validated_profile(&self) -> Result<crate::config::SshProfile, String> {
+        let name = self.name_entry.text().trim().to_string();
+        if name.is_empty() {
+            return Err("Profile name is required.".to_string());
+        }
+
+        let host = self.host_entry.text().trim().to_string();
+        if host.is_empty() {
+            return Err("Host / SSH config alias is required.".to_string());
+        }
+        if host.starts_with('-') || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(
+                "Host must not start with '-' or contain whitespace/control characters."
+                    .to_string(),
+            );
+        }
+
+        let user_raw = self.user_entry.text().trim().to_string();
+        let user = if user_raw.is_empty() {
+            None
+        } else {
+            if user_raw.starts_with('-')
+                || user_raw.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(
+                    "User must not start with '-' or contain whitespace/control characters."
+                        .to_string(),
+                );
+            }
+            Some(user_raw)
+        };
+
+        let port_raw = self.port_entry.text().trim().to_string();
+        let port = if port_raw.is_empty() {
+            None
+        } else {
+            let parsed = port_raw
+                .parse::<u16>()
+                .map_err(|_| "Port must be a number between 1 and 65535.".to_string())?;
+            if parsed == 0 {
+                return Err("Port must be a number between 1 and 65535.".to_string());
+            }
+            Some(parsed)
+        };
+
+        let auth_kind = self.selected_auth_kind();
+        let ident_raw = self.identity_entry.text().trim().to_string();
+        let identity_file = if auth_kind == crate::config::SshAuthKind::IdentityFile {
+            if ident_raw.is_empty() {
+                return Err(
+                    "Identity file path is required for Identity File authentication.".to_string(),
+                );
+            }
+            if ident_raw.chars().any(|c| c.is_control()) {
+                return Err("Identity file path contains invalid control characters.".to_string());
+            }
+            Some(std::path::PathBuf::from(ident_raw))
+        } else {
+            None
+        };
+
+        let multiplexer_priority = if self.mux_dropdown.selected() == 1 {
+            vec![
+                crate::config::MultiplexerKind::Screen,
+                crate::config::MultiplexerKind::Tmux,
+            ]
+        } else {
+            crate::config::default_multiplexer_order()
+        };
+
+        let id = self
+            .selected_id
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| glib::uuid_string_random().to_string());
+
+        Ok(crate::config::SshProfile {
+            id,
+            name,
+            host,
+            user,
+            port,
+            auth_kind,
+            identity_file,
+            multiplexer_priority,
+            bypass_multiplexer_probe: self.bypass_switch.is_active(),
+            use_control_master: self.cm_switch.is_active(),
+        })
+    }
+
+    fn save_and_maybe_connect(&self, connect_after: bool) {
+        if self.in_flight.get() {
+            return;
+        }
+
+        let profile = match self.collect_validated_profile() {
+            Ok(p) => p,
+            Err(msg) => {
+                self.set_status(&msg, true);
+                return;
+            }
+        };
+
+        let secret_text = self.secret_entry.text().to_string();
+        let prev_auth = *self.loaded_auth_kind.borrow();
+        let is_existing = self.selected_id.borrow().is_some();
+        let id = profile.id.clone();
+
+        if profile.auth_kind == crate::config::SshAuthKind::AgentOrDefault {
+            let need_delete_stale = is_existing
+                && matches!(
+                    prev_auth,
+                    Some(
+                        crate::config::SshAuthKind::PasswordKeyring
+                            | crate::config::SshAuthKind::IdentityFile
+                    )
+                );
+
+            if !need_delete_stale {
+                if let Err(e) = self.config_manager.borrow_mut().upsert_ssh_profile(profile) {
+                    self.set_status(&format!("Failed to save profile: {e}"), true);
+                    return;
+                }
+                self.finish_saved_profile(&id, crate::config::SshAuthKind::AgentOrDefault, false);
+                self.set_status("Profile saved.", false);
+                if connect_after {
+                    self.trigger_connect(&id);
+                }
+                return;
+            }
+
+            self.set_busy(true);
+            self.set_status("Clearing old keyring secret and saving profile...", false);
+            let (tx, rx) = async_channel::bounded(1);
+            crate::ssh::SecretServiceClient::delete_secret_async(id.clone(), None, tx);
+            let form = self.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let delete_res = rx.recv().await;
+                let upsert_res = form.config_manager.borrow_mut().upsert_ssh_profile(profile);
+                if let Err(e) = upsert_res {
+                    form.set_busy(false);
+                    form.set_status(&format!("Failed to save profile: {e}"), true);
+                    return;
+                }
+                form.finish_saved_profile(&id, crate::config::SshAuthKind::AgentOrDefault, true);
+                form.set_busy(false);
+                match delete_res {
+                    Ok(Ok(())) => {
+                        form.set_status("Profile saved and old secret removed from keyring.", false);
+                        if connect_after {
+                            form.trigger_connect(&id);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        form.set_status(
+                            &format!("Profile saved, warning clearing old secret: {e}"),
+                            true,
+                        );
+                    }
+                    Err(_) => {
+                        form.set_status(
+                            "Profile saved, warning: keyring worker exited unexpectedly.",
+                            true,
+                        );
+                    }
+                }
+            });
+            return;
+        }
+
+        let (target_kind, opposite_kind) = match profile.auth_kind {
+            crate::config::SshAuthKind::PasswordKeyring => ("password", Some("passphrase")),
+            crate::config::SshAuthKind::IdentityFile => ("passphrase", Some("password")),
+            crate::config::SshAuthKind::AgentOrDefault => unreachable!(),
+        };
+
+        let need_store = !secret_text.is_empty();
+        let need_delete_opposite = is_existing
+            && matches!(
+                prev_auth,
+                Some(
+                    crate::config::SshAuthKind::PasswordKeyring
+                        | crate::config::SshAuthKind::IdentityFile
+                )
+            )
+            && prev_auth != Some(profile.auth_kind);
+
+        if !need_store && !need_delete_opposite {
+            let auth_kind = profile.auth_kind;
+            if let Err(e) = self.config_manager.borrow_mut().upsert_ssh_profile(profile) {
+                self.set_status(&format!("Failed to save profile: {e}"), true);
+                return;
+            }
+            self.finish_saved_profile(&id, auth_kind, false);
+            self.set_status("Profile saved.", false);
+            if connect_after {
+                self.trigger_connect(&id);
+            }
+            return;
+        }
+
+        self.set_busy(true);
+        self.set_status("Saving secret to system keyring...", false);
+        let form = self.clone();
+        let label = format!("WhattyTheShell SSH: {}", profile.name);
+        let auth_kind = profile.auth_kind;
+        glib::MainContext::default().spawn_local(async move {
+            if need_store {
+                let (tx, rx) = async_channel::bounded(1);
+                crate::ssh::SecretServiceClient::store_secret_async(
+                    id.clone(),
+                    label,
+                    target_kind.to_string(),
+                    secret_text,
+                    tx,
+                );
+                match rx.recv().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        form.set_busy(false);
+                        form.set_status(&format!("Keyring error (not saved): {e}"), true);
+                        return;
+                    }
+                    Err(_) => {
+                        form.set_busy(false);
+                        form.set_status("Keyring worker exited unexpectedly.", true);
+                        return;
+                    }
+                }
+            }
+
+            let mut delete_warning: Option<String> = None;
+            if need_delete_opposite && let Some(opp) = opposite_kind {
+                let (tx2, rx2) = async_channel::bounded(1);
+                crate::ssh::SecretServiceClient::delete_secret_async(
+                    id.clone(),
+                    Some(opp.to_string()),
+                    tx2,
+                );
+                match rx2.recv().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        delete_warning = Some(format!(
+                            "Saved, warning removing previous secret: {e}"
+                        ));
+                    }
+                    Err(_) => {
+                        delete_warning = Some(
+                            "Saved, warning: keyring cleanup worker exited.".to_string(),
+                        );
+                    }
+                }
+            }
+
+            if let Err(e) = form.config_manager.borrow_mut().upsert_ssh_profile(profile) {
+                form.set_busy(false);
+                form.set_status(&format!("Failed to save profile config: {e}"), true);
+                return;
+            }
+
+            form.finish_saved_profile(&id, auth_kind, true);
+            form.set_busy(false);
+            if let Some(warn) = delete_warning {
+                form.set_status(&warn, true);
+            } else if need_store {
+                form.set_status("Profile and secret saved to system keyring.", false);
+            } else {
+                form.set_status("Profile saved.", false);
+            }
+            if connect_after {
+                form.trigger_connect(&id);
+            }
+        });
+    }
+
+    fn finish_saved_profile(
+        &self,
+        id: &str,
+        auth_kind: crate::config::SshAuthKind,
+        clear_secret_entry: bool,
+    ) {
+        if clear_secret_entry {
+            self.secret_entry.set_text("");
+        }
+        *self.selected_id.borrow_mut() = Some(id.to_string());
+        *self.loaded_auth_kind.borrow_mut() = Some(auth_kind);
+        self.reload_list(Some(id));
+        self.refresh_auth_fields();
+    }
+
+    fn trigger_connect(&self, id: &str) {
+        if self.dialog_window.is_visible() {
+            let _ = gtk4::prelude::WidgetExt::activate_action(
+                &self.parent_window,
+                "win.launch-ssh-profile",
+                Some(&id.to_variant()),
+            );
+            self.dialog_window.close();
+        }
+    }
+}
+
+fn format_ssh_target(p: &crate::config::SshProfile) -> String {
+    let base = match p.user.as_deref() {
+        Some(u) if !u.is_empty() => format!("{u}@{}", p.host),
+        _ => p.host.clone(),
+    };
+    match p.port {
+        Some(port) => format!("{base}:{port}"),
+        None => base,
+    }
+}
+
+fn build_labeled_field(title: &str, control: &impl IsA<gtk4::Widget>) -> GtkBox {
+    let row = GtkBox::new(Orientation::Vertical, 4);
+    let label = Label::new(Some(title));
+    label.set_halign(Align::Start);
+    row.append(&label);
+    row.append(control);
+    row
+}
+
+fn build_ssh_sessions_tab(
+    parent: &ApplicationWindow,
+    dialog: &Window,
+    config_manager: std::rc::Rc<std::cell::RefCell<crate::config::ConfigManager>>,
+) -> GtkBox {
+    let root = GtkBox::new(Orientation::Horizontal, 16);
+    root.set_margin_top(12);
+    root.set_vexpand(true);
+    root.set_hexpand(true);
+
+    // Left column: saved profile list + New Profile button
+    let left_col = GtkBox::new(Orientation::Vertical, 8);
+    left_col.set_width_request(230);
+
+    let list_heading = Label::new(Some("Saved Profiles"));
+    list_heading.set_halign(Align::Start);
+    list_heading.add_css_class("heading");
+    left_col.append(&list_heading);
+
+    let list_box = ListBox::new();
+    list_box.set_selection_mode(gtk4::SelectionMode::Single);
+    list_box.add_css_class("boxed-list");
+
+    let list_scroll = ScrolledWindow::new();
+    list_scroll.set_vexpand(true);
+    list_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    list_scroll.set_child(Some(&list_box));
+    left_col.append(&list_scroll);
+
+    let new_btn = Button::with_label("+ New Profile");
+    left_col.append(&new_btn);
+    root.append(&left_col);
+
+    // Right column: editor form
+    let form_scroll = ScrolledWindow::new();
+    form_scroll.set_hexpand(true);
+    form_scroll.set_vexpand(true);
+    form_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+
+    let form_box = GtkBox::new(Orientation::Vertical, 10);
+    form_box.set_margin_end(6);
+
+    let name_entry = Entry::new();
+    name_entry.set_placeholder_text(Some("e.g., Prod Bastion"));
+    form_box.append(&build_labeled_field("Profile Name", &name_entry));
+
+    let host_entry = Entry::new();
+    host_entry.set_placeholder_text(Some("hostname, IP, or SSH config alias"));
+    form_box.append(&build_labeled_field("Host / SSH Config Alias", &host_entry));
+
+    let user_port_row = GtkBox::new(Orientation::Horizontal, 12);
+    let user_entry = Entry::new();
+    user_entry.set_placeholder_text(Some("optional"));
+    let user_field = build_labeled_field("User (optional)", &user_entry);
+    user_field.set_hexpand(true);
+
+    let port_entry = Entry::new();
+    port_entry.set_placeholder_text(Some("22"));
+    port_entry.set_width_chars(8);
+    let port_field = build_labeled_field("Port (optional)", &port_entry);
+
+    user_port_row.append(&user_field);
+    user_port_row.append(&port_field);
+    form_box.append(&user_port_row);
+
+    let auth_dropdown = DropDown::from_strings(&[
+        "SSH Agent / Default Keys",
+        "Identity File (Key)",
+        "Password (System Keyring)",
+    ]);
+    form_box.append(&build_labeled_field("Authentication", &auth_dropdown));
+
+    let identity_entry = Entry::new();
+    identity_entry.set_placeholder_text(Some("~/.ssh/id_ed25519"));
+    let identity_row = build_labeled_field("Identity File Path", &identity_entry);
+    form_box.append(&identity_row);
+
+    let secret_label = Label::new(Some("Secret (System Keyring)"));
+    secret_label.set_halign(Align::Start);
+    let secret_input_row = GtkBox::new(Orientation::Horizontal, 8);
+    let secret_entry = PasswordEntry::new();
+    secret_entry.set_show_peek_icon(true);
+    secret_entry.set_hexpand(true);
+    let clear_secret_btn = Button::with_label("Clear stored secret");
+    secret_input_row.append(&secret_entry);
+    secret_input_row.append(&clear_secret_btn);
+
+    let secret_row = GtkBox::new(Orientation::Vertical, 4);
+    secret_row.append(&secret_label);
+    secret_row.append(&secret_input_row);
+    form_box.append(&secret_row);
+
+    let mux_dropdown = DropDown::from_strings(&["tmux → screen", "screen → tmux"]);
+    form_box.append(&build_labeled_field("Multiplexer Priority", &mux_dropdown));
+
+    let cm_row = GtkBox::new(Orientation::Horizontal, 12);
+    let cm_label = Label::new(Some("Use ControlMaster (connection sharing)"));
+    cm_label.set_halign(Align::Start);
+    cm_label.set_hexpand(true);
+    let cm_switch = Switch::new();
+    cm_switch.set_valign(Align::Center);
+    cm_row.append(&cm_label);
+    cm_row.append(&cm_switch);
+    form_box.append(&cm_row);
+
+    let bypass_row = GtkBox::new(Orientation::Horizontal, 12);
+    let bypass_label = Label::new(Some("Bypass multiplexer probe (ephemeral shell)"));
+    bypass_label.set_halign(Align::Start);
+    bypass_label.set_hexpand(true);
+    let bypass_switch = Switch::new();
+    bypass_switch.set_valign(Align::Center);
+    bypass_row.append(&bypass_label);
+    bypass_row.append(&bypass_switch);
+    form_box.append(&bypass_row);
+
+    let status_label = Label::new(None);
+    status_label.set_halign(Align::Start);
+    status_label.set_wrap(true);
+    form_box.append(&status_label);
+
+    let action_row = GtkBox::new(Orientation::Horizontal, 8);
+    action_row.set_halign(Align::End);
+    action_row.set_margin_top(6);
+    let delete_btn = Button::with_label("Delete Profile");
+    delete_btn.add_css_class("destructive-action");
+    let save_btn = Button::with_label("Save Profile");
+    let connect_btn = Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    action_row.append(&delete_btn);
+    action_row.append(&save_btn);
+    action_row.append(&connect_btn);
+    form_box.append(&action_row);
+
+    form_scroll.set_child(Some(&form_box));
+    root.append(&form_scroll);
+
+    let widgets = SshFormWidgets {
+        list_box,
+        displayed_ids: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        selected_id: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        loaded_auth_kind: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        loading: std::rc::Rc::new(std::cell::Cell::new(false)),
+        in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
+        name_entry,
+        host_entry,
+        user_entry,
+        port_entry,
+        auth_dropdown,
+        identity_row,
+        identity_entry,
+        secret_row,
+        secret_label,
+        secret_entry,
+        clear_secret_btn,
+        mux_dropdown,
+        cm_switch,
+        bypass_switch,
+        status_label,
+        new_btn,
+        save_btn,
+        delete_btn,
+        connect_btn,
+        config_manager,
+        parent_window: parent.clone(),
+        dialog_window: dialog.clone(),
+    };
+
+    // Initial populate
+    let initial_profiles = widgets.config_manager.borrow().ssh_profiles();
+    if let Some(first) = initial_profiles.first().cloned() {
+        widgets.reload_list(Some(&first.id));
+        widgets.load_profile(&first);
+    } else {
+        widgets.reload_list(None);
+        widgets.load_new_profile();
+    }
+
+    // Signals
+    let w_row = widgets.clone();
+    widgets.list_box.connect_row_selected(move |_, row_opt| {
+        if w_row.loading.get() || w_row.in_flight.get() {
+            return;
+        }
+        let Some(row) = row_opt else { return };
+        let idx = row.index();
+        if idx < 0 {
+            return;
+        }
+        let id_opt = w_row.displayed_ids.borrow().get(idx as usize).cloned();
+        if let Some(id) = id_opt
+            && let Some(profile) = w_row.config_manager.borrow().get_ssh_profile(&id)
+        {
+            w_row.load_profile(&profile);
+        }
+    });
+
+    let w_new = widgets.clone();
+    widgets.new_btn.connect_clicked(move |_| {
+        if !w_new.in_flight.get() {
+            w_new.load_new_profile();
+        }
+    });
+
+    let w_auth = widgets.clone();
+    widgets.auth_dropdown.connect_selected_notify(move |_| {
+        if !w_auth.loading.get() {
+            w_auth.refresh_auth_fields();
+        }
+    });
+
+    let w_save = widgets.clone();
+    widgets.save_btn.connect_clicked(move |_| {
+        w_save.save_and_maybe_connect(false);
+    });
+
+    let w_connect = widgets.clone();
+    widgets.connect_btn.connect_clicked(move |_| {
+        w_connect.save_and_maybe_connect(true);
+    });
+
+    let w_clear = widgets.clone();
+    widgets.clear_secret_btn.connect_clicked(move |_| {
+        if w_clear.in_flight.get() {
+            return;
+        }
+        let Some(id) = w_clear.selected_id.borrow().clone() else {
+            return;
+        };
+        w_clear.set_busy(true);
+        w_clear.set_status("Clearing stored secret from keyring...", false);
+        let (tx, rx) = async_channel::bounded(1);
+        crate::ssh::SecretServiceClient::delete_secret_async(id, None, tx);
+        let form = w_clear.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let res = rx.recv().await;
+            form.set_busy(false);
+            match res {
+                Ok(Ok(())) => {
+                    form.secret_entry.set_text("");
+                    form.set_status("Stored secret cleared from keyring.", false);
+                }
+                Ok(Err(e)) => {
+                    form.set_status(&format!("Failed to clear keyring secret: {e}"), true);
+                }
+                Err(_) => {
+                    form.set_status("Keyring worker exited unexpectedly.", true);
+                }
+            }
+        });
+    });
+
+    let w_del = widgets.clone();
+    widgets.delete_btn.connect_clicked(move |_| {
+        if w_del.in_flight.get() {
+            return;
+        }
+        let Some(id) = w_del.selected_id.borrow().clone() else {
+            return;
+        };
+        match w_del.config_manager.borrow_mut().remove_ssh_profile(&id) {
+            Ok(_) => {
+                w_del.set_busy(true);
+                w_del.set_status("Deleting profile and keyring secret...", false);
+                let (tx, rx) = async_channel::bounded(1);
+                crate::ssh::SecretServiceClient::delete_secret_async(id, None, tx);
+                let form = w_del.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let res = rx.recv().await;
+                    form.set_busy(false);
+                    let next = form.config_manager.borrow().ssh_profiles();
+                    if let Some(first) = next.first().cloned() {
+                        form.reload_list(Some(&first.id));
+                        form.load_profile(&first);
+                    } else {
+                        form.reload_list(None);
+                        form.load_new_profile();
+                    }
+                    match res {
+                        Ok(Ok(())) => form.set_status("Profile and secret deleted.", false),
+                        Ok(Err(e)) => form.set_status(
+                            &format!("Profile deleted, warning clearing secret: {e}"),
+                            true,
+                        ),
+                        Err(_) => {
+                            form.set_status("Profile deleted; keyring worker exited.", true)
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                w_del.set_status(&format!("Failed to delete profile: {e}"), true);
+            }
+        }
+    });
+
+    root
 }

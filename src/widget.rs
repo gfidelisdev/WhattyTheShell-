@@ -14,7 +14,7 @@ use gtk4::graphene;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-fn unix_fd_add_local<F>(fd: i32, condition: glib::IOCondition, func: F) -> glib::SourceId
+pub(crate) fn unix_fd_add_local<F>(fd: i32, condition: glib::IOCondition, func: F) -> glib::SourceId
 where
     F: FnMut(i32, glib::IOCondition) -> glib::ControlFlow + 'static,
 {
@@ -65,6 +65,33 @@ use crate::render::dmabuf::DmabufFrame;
 use crate::render::pipeline::{SelectionRange, TerminalRenderer};
 use crate::term::Terminal;
 
+/// Tracks whether a terminal pane runs a local shell or a saved SSH session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionOrigin {
+    Local,
+    SavedSsh {
+        profile_id: String,
+        profile_name: String,
+        pre_ssh_local_dir: Option<std::path::PathBuf>,
+    },
+}
+
+fn evaluate_ssh_eof_action(origin: &SessionOrigin, exit_code: Option<i32>, term: &mut Terminal) -> bool {
+    if !matches!(origin, SessionOrigin::SavedSsh { .. }) {
+        return false;
+    }
+    match exit_code {
+        Some(code) if code != 0 => {
+            let banner = format!(
+                "\r\n\x1b[1;31m[WhattyTheShell: SSH connection exited with code {code}. Press Enter to close.]\x1b[0m\r\n"
+            );
+            term.advance(banner.as_bytes());
+            true
+        }
+        _ => false,
+    }
+}
+
 mod imp {
     use super::*;
 
@@ -91,6 +118,9 @@ mod imp {
         pub drag_mouse_pos: RefCell<Option<(f64, f64)>>,
         pub autoscroll_source_id: RefCell<Option<glib::SourceId>>,
         pub custom_title: RefCell<Option<String>>,
+        pub session_origin: RefCell<SessionOrigin>,
+        pub awaiting_error_dismiss: std::cell::Cell<bool>,
+        pub askpass_attempt: RefCell<Option<crate::ssh::AskpassAttempt>>,
         pub dpi_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub pty_source_id: RefCell<Option<glib::SourceId>>,
         pub im_context: gtk4::IMMulticontext,
@@ -134,6 +164,7 @@ mod imp {
         fn dispose(&self) {
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+                *inner.askpass_attempt.borrow_mut() = None;
                 if let Some(source_id) = inner.autoscroll_source_id.borrow_mut().take() {
                     source_id.remove();
                 }
@@ -307,6 +338,7 @@ impl TerminalView {
     pub fn terminate(&self) {
         if let Some(inner) = self.imp().inner.borrow_mut().take() {
             inner.im_context.set_client_widget(None::<&gtk4::Widget>);
+            *inner.askpass_attempt.borrow_mut() = None;
             if let Some(source_id) = inner.autoscroll_source_id.borrow_mut().take() {
                 source_id.remove();
             }
@@ -396,6 +428,91 @@ impl TerminalView {
         font_size: f32,
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_shell_and_working_dir(device, queue, font_family, font_size, None, cwd)
+    }
+
+    pub fn with_shell_and_working_dir(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        font_family: Option<String>,
+        font_size: f32,
+        shell: Option<&str>,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pty = Pty::spawn_with_shell(shell, 80, 24, cwd)?;
+        Self::with_pty_and_origin(
+            device,
+            queue,
+            font_family,
+            font_size,
+            pty,
+            SessionOrigin::Local,
+            None,
+        )
+    }
+
+    /// Spawn an interactive SSH session using `profile`, `AskpassBroker`, and `pre_ssh_local_dir`.
+    pub fn with_ssh_profile(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        font_family: Option<String>,
+        font_size: f32,
+        profile: &crate::config::SshProfile,
+        broker: &crate::ssh::AskpassBroker,
+        window: &gtk4::ApplicationWindow,
+        pre_ssh_local_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let attempt = if profile.auth_kind != crate::config::SshAuthKind::AgentOrDefault {
+            Some(broker.register_attempt(
+                window,
+                profile.id.clone(),
+                profile.name.clone(),
+                profile.auth_kind,
+            )?)
+        } else {
+            None
+        };
+
+        let attempt_ref = attempt.as_ref().map(|a| (a.socket_path(), a.nonce()));
+        let (program, args, envs) = crate::ssh::build_ssh_invocation(profile, attempt_ref)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let env_refs: Vec<(&str, &str)> =
+            envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let pty = Pty::spawn_with_env(
+            &program,
+            &arg_refs,
+            80,
+            24,
+            pre_ssh_local_dir.as_deref(),
+            &env_refs,
+        )?;
+
+        Self::with_pty_and_origin(
+            device,
+            queue,
+            font_family,
+            font_size,
+            pty,
+            SessionOrigin::SavedSsh {
+                profile_id: profile.id.clone(),
+                profile_name: profile.name.clone(),
+                pre_ssh_local_dir,
+            },
+            attempt,
+        )
+    }
+
+    fn with_pty_and_origin(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        font_family: Option<String>,
+        font_size: f32,
+        pty: Pty,
+        session_origin: SessionOrigin,
+        askpass_attempt: Option<crate::ssh::AskpassAttempt>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let widget: Self = glib::Object::builder().build();
 
         let scale = widget.scale_factor().max(1);
@@ -409,12 +526,7 @@ impl TerminalView {
         let init_cols = 80;
         let init_rows = 24;
 
-        let pty = Arc::new(Mutex::new(Pty::spawn_shell(
-            init_cols as u16,
-            init_rows as u16,
-            cwd,
-        )?));
-
+        let pty = Arc::new(Mutex::new(pty));
         let terminal = Arc::new(Mutex::new(Terminal::new(init_cols, init_rows)));
 
         let init_w = ((init_cols as f32 * cell_w) / scale as f32).ceil() as u32;
@@ -449,6 +561,9 @@ impl TerminalView {
             drag_mouse_pos: RefCell::new(None),
             autoscroll_source_id: RefCell::new(None),
             custom_title: RefCell::new(None),
+            session_origin: RefCell::new(session_origin),
+            awaiting_error_dismiss: std::cell::Cell::new(false),
+            askpass_attempt: RefCell::new(askpass_attempt),
             dpi_handler_id: RefCell::new(None),
             pty_source_id: RefCell::new(None),
             im_context: im_context.clone(),
@@ -468,6 +583,7 @@ impl TerminalView {
                 };
 
                 let mut exited = false;
+                let mut hold_open = false;
                 let mut read_any = false;
                 let mut buf = [0u8; 8192];
 
@@ -517,6 +633,30 @@ impl TerminalView {
 
                     if exited {
                         *inner.pty_source_id.borrow_mut() = None;
+                        *inner.askpass_attempt.borrow_mut() = None;
+
+                        let origin_clone = inner.session_origin.borrow().clone();
+                        if matches!(origin_clone, SessionOrigin::SavedSsh { .. }) {
+                            let mut code = None;
+                            if let Ok(mut pty) = inner.pty.lock() {
+                                for attempt in 0..5 {
+                                    code = pty.try_wait_exit_code();
+                                    if code.is_some() {
+                                        break;
+                                    }
+                                    if attempt < 4 {
+                                        std::thread::sleep(std::time::Duration::from_millis(2));
+                                    }
+                                }
+                            }
+                            if let Ok(mut term) = inner.terminal.lock() {
+                                if evaluate_ssh_eof_action(&origin_clone, code, &mut term) {
+                                    inner.awaiting_error_dismiss.set(true);
+                                    hold_open = true;
+                                    read_any = true;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -525,7 +665,9 @@ impl TerminalView {
                 }
 
                 if exited {
-                    widget.emit_by_name::<()>("child-exited", &[]);
+                    if !hold_open {
+                        widget.emit_by_name::<()>("child-exited", &[]);
+                    }
                     return glib::ControlFlow::Break;
                 }
 
@@ -546,6 +688,9 @@ impl TerminalView {
             if let Some(w) = widget_for_im.upgrade() {
                 let mut need_draw = false;
                 if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                    if inner.awaiting_error_dismiss.get() {
+                        return;
+                    }
                     if let Ok(mut term) = inner.terminal.lock() {
                         if term.display_offset() > 0 {
                             term.scroll_to_bottom();
@@ -596,7 +741,7 @@ impl TerminalView {
                 None => return glib::Propagation::Proceed,
             };
 
-            let (term_for_keys, pty_for_keys) = {
+            let (term_for_keys, pty_for_keys, awaiting_dismiss) = {
                 let inner_guard = w.imp().inner.borrow();
                 let inner = match inner_guard.as_ref() {
                     Some(i) => i,
@@ -617,7 +762,11 @@ impl TerminalView {
                         }
                     }
                 }
-                (inner.terminal.clone(), inner.pty.clone())
+                (
+                    inner.terminal.clone(),
+                    inner.pty.clone(),
+                    inner.awaiting_error_dismiss.get(),
+                )
             };
 
             // Ctrl+Shift shortcuts (Copy, Paste, Move Tab Left/Right)
@@ -628,7 +777,9 @@ impl TerminalView {
                         return glib::Propagation::Stop;
                     }
                     gdk::Key::V | gdk::Key::v => {
-                        w.paste_clipboard();
+                        if !awaiting_dismiss {
+                            w.paste_clipboard();
+                        }
                         return glib::Propagation::Stop;
                     }
                     gdk::Key::Page_Up | gdk::Key::KP_Page_Up => {
@@ -704,6 +855,19 @@ impl TerminalView {
                         }
                     }
                 }
+            }
+
+            if awaiting_dismiss {
+                if (keyval == gdk::Key::Return || keyval == gdk::Key::KP_Enter)
+                    && !is_ctrl
+                    && !is_alt
+                {
+                    if let Some(inner) = w.imp().inner.borrow().as_ref() {
+                        inner.awaiting_error_dismiss.set(false);
+                    }
+                    w.emit_by_name::<()>("child-exited", &[]);
+                }
+                return glib::Propagation::Stop;
             }
 
             let mut bytes = Vec::new();
@@ -1315,8 +1479,40 @@ impl TerminalView {
     pub fn current_working_dir(&self) -> Option<std::path::PathBuf> {
         let inner_guard = self.imp().inner.borrow();
         let inner = inner_guard.as_ref()?;
+        if let SessionOrigin::SavedSsh {
+            ref pre_ssh_local_dir,
+            ..
+        } = *inner.session_origin.borrow()
+        {
+            return pre_ssh_local_dir.clone();
+        }
         let pty = inner.pty.lock().ok()?;
         pty.current_working_dir()
+    }
+
+    pub fn session_origin(&self) -> SessionOrigin {
+        let inner_guard = self.imp().inner.borrow();
+        inner_guard
+            .as_ref()
+            .map(|i| i.session_origin.borrow().clone())
+            .unwrap_or(SessionOrigin::Local)
+    }
+
+    pub fn is_awaiting_error_dismiss(&self) -> bool {
+        let inner_guard = self.imp().inner.borrow();
+        inner_guard
+            .as_ref()
+            .map(|i| i.awaiting_error_dismiss.get())
+            .unwrap_or(false)
+    }
+
+    /// Automatic `(display_title, tooltip)` for this pane (`SavedSsh` profile name or formatted local CWD).
+    pub fn auto_tab_title(&self) -> Option<(String, String)> {
+        if let SessionOrigin::SavedSsh { profile_name, .. } = self.session_origin() {
+            return Some((profile_name.clone(), format!("SSH: {profile_name}")));
+        }
+        self.current_working_dir()
+            .map(|cwd| (crate::format_dir_path(&cwd), cwd.to_string_lossy().into_owned()))
     }
 
     pub fn custom_title(&self) -> Option<String> {
@@ -1526,6 +1722,9 @@ impl TerminalView {
     }
 
     pub fn paste_clipboard(&self) {
+        if self.is_awaiting_error_dismiss() {
+            return;
+        }
         let pty_clone = self.imp().inner.borrow().as_ref().map(|i| (i.pty.clone(), i.terminal.clone()));
         if let Some((pty, term)) = pty_clone {
             self.display().clipboard().read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
@@ -1545,6 +1744,9 @@ impl TerminalView {
     }
 
     pub fn paste_primary(&self) {
+        if self.is_awaiting_error_dismiss() {
+            return;
+        }
         let pty_clone = self.imp().inner.borrow().as_ref().map(|i| (i.pty.clone(), i.terminal.clone()));
         if let Some((pty, term)) = pty_clone {
             self.display().primary_clipboard().read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
@@ -1735,18 +1937,28 @@ fn parse_path_and_location(raw: &str) -> (String, Option<usize>, Option<usize>) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn lock_gtk_main_thread() -> Option<std::sync::MutexGuard<'static, ()>> {
+        static GTK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = GTK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if gtk4::is_initialized() {
+            if !gtk4::is_initialized_main_thread() {
+                return None;
+            }
+        } else if gtk4::init().is_err() {
+            return None;
+        }
+        Some(guard)
+    }
 
     #[test]
     fn test_terminal_view_terminate_reaps_child() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
 
         let instance = wgpu::Instance::default();
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1792,13 +2004,10 @@ mod tests {
 
     #[test]
     fn test_pixel_to_buffer_cell_and_scroll() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
 
         let instance = wgpu::Instance::default();
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1822,7 +2031,9 @@ mod tests {
             let inner_guard = view.imp().inner.borrow();
             let inner = inner_guard.as_ref().unwrap();
             let mut term = inner.terminal.lock().unwrap();
-            term.advance(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4");
+            for i in 0..30 {
+                term.advance(format!("line {i}\r\n").as_bytes());
+            }
         }
 
         let cell0 = view.pixel_to_buffer_cell(10.0, 10.0).unwrap();
@@ -1879,13 +2090,10 @@ mod tests {
 
     #[test]
     fn test_open_close_tabs_memory_leak() {
-        if gtk4::is_initialized() {
-            if !gtk4::is_initialized_main_thread() {
-                return;
-            }
-        } else if gtk4::init().is_err() {
-            return;
-        }
+        let _gtk_guard = match lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
 
         let instance = wgpu::Instance::default();
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1975,7 +2183,8 @@ mod tests {
                 let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
                 let pop = gtk4::Popover::new();
                 pop.set_parent(&tab_box);
-                notebook.append_page(&v, Some(&tab_box));
+                notebook.append_page(&v, None::<&gtk4::Widget>);
+                notebook.set_tab_label(&v, Some(&tab_box));
 
                 weak_views.push(v.downgrade());
                 weak_tab_boxes.push(tab_box.downgrade());
@@ -2027,6 +2236,125 @@ mod tests {
             after_cycle_rss[2],
             growth_c1_to_c3
         );
+    }
+
+    #[test]
+    fn test_session_origin_getters_and_current_working_dir() {
+        let mut term = Terminal::new(80, 24);
+        let origin = SessionOrigin::SavedSsh {
+            profile_id: "id-1".into(),
+            profile_name: "Prod API".into(),
+            pre_ssh_local_dir: Some(std::path::PathBuf::from("/tmp")),
+        };
+        assert!(!evaluate_ssh_eof_action(&origin, Some(0), &mut term));
+
+        let _gtk_guard = match lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let pty = Pty::spawn_with_env("/bin/sh", &["-c", "sleep 1"], 80, 24, None, &[]).unwrap();
+        let view = TerminalView::with_pty_and_origin(
+            device,
+            queue,
+            None,
+            12.0,
+            pty,
+            origin.clone(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(view.session_origin(), origin);
+        assert_eq!(view.current_working_dir(), Some(std::path::PathBuf::from("/tmp")));
+        assert!(!view.is_awaiting_error_dismiss());
+        assert_eq!(
+            view.auto_tab_title(),
+            Some(("Prod API".into(), "SSH: Prod API".into()))
+        );
+        view.terminate();
+    }
+
+    #[test]
+    fn test_saved_ssh_nonzero_exit_sets_error_dismiss_without_exiting() {
+        let mut term = Terminal::new(80, 24);
+        let origin = SessionOrigin::SavedSsh {
+            profile_id: "id-fail".into(),
+            profile_name: "Broken Host".into(),
+            pre_ssh_local_dir: Some(std::path::PathBuf::from("/tmp")),
+        };
+        assert!(evaluate_ssh_eof_action(&origin, Some(255), &mut term));
+        let rendered = term.grid().text();
+        assert!(rendered.contains("SSH connection exited with code 255. Press Enter to close."));
+
+        let _gtk_guard = match lock_gtk_main_thread() {
+            Some(g) => g,
+            None => return,
+        };
+        let instance = wgpu::Instance::default();
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        let pty = Pty::spawn_with_env("/bin/sh", &["-c", "exit 42"], 80, 24, None, &[]).unwrap();
+        let view = TerminalView::with_pty_and_origin(
+            device,
+            queue,
+            None,
+            12.0,
+            pty,
+            origin,
+            None,
+        )
+        .unwrap();
+
+        let exited_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exited_cb = exited_flag.clone();
+        view.connect_closure(
+            "child-exited",
+            false,
+            glib::closure_local!(move |_v: TerminalView| {
+                exited_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !view.is_awaiting_error_dismiss() && std::time::Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(view.is_awaiting_error_dismiss());
+        assert!(!exited_flag.load(std::sync::atomic::Ordering::SeqCst));
+        view.terminate();
     }
 }
 

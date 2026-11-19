@@ -128,4 +128,28 @@ _Avoid_: Loop monopolization, UI lockup
 The deterministic closure of exported Linux file descriptors triggered by GTK texture destruction callbacks to prevent per-process file descriptor exhaustion.
 _Avoid_: FD leakage, unmanaged descriptor
 
+## Remote SSH Sessions
+
+Manages saved remote SSH profiles, `org.freedesktop.secrets` keyring credentials, isolated UNIX-socket `SSH_ASKPASS` prompts, and remote `tmux`/`screen` session discovery.
+
+**SSH Profile (`config::SshProfile`)**:
+A saved remote connection configuration stored in `$XDG_CONFIG_HOME/WhattyTheShell!/config.toml` (`id`, `name`, `host`, optional `user`/`port`, `auth_kind`, optional `identity_file`, `multiplexer_priority`, `bypass_multiplexer_probe`, `use_control_master`) with zero secret material written to disk.
+_Avoid_: Saved connection string, plaintext host entry
+
+**Multiplexer Bootstrap (`ssh::build_remote_bootstrap_script`)**:
+A single-line POSIX `sh -c` remote command honoring user-configured `tmux` and `screen` priority order to discover active remote sessions, prompt to attach or create one, or fall back to an ephemeral interactive login shell.
+_Avoid_: Raw bash init snippet, forced tmux attach
+
+**System Keyring (`ssh::SecretServiceClient`)**:
+The FreeDesktop `org.freedesktop.secrets` D-Bus client that stores, retrieves, and removes SSH passwords and key passphrases for a profile UUID (`SecretServiceClient::lookup_secret_sync`, `store_secret_sync`, `delete_secret_sync`, `store_secret_async`, `delete_secret_async`).
+_Avoid_: Config password field, environment variable secret
+
+**Askpass Broker (`ssh::AskpassBroker` / `ssh::AskpassAttempt` / `ssh::run_askpass_client_and_exit`)**:
+A process-local `0o600` UNIX domain socket listener verified via `SO_PEERCRED` (`uid == getuid()`) and single-use 128-bit nonces that serves `SSH_ASKPASS` requests from keyring secrets or modal GTK4 dialogs without injecting credentials into PTY stdin or inherited environments.
+_Avoid_: Expect script, sshpass wrapper
+
+**Pre-SSH Local Directory (`pre_ssh_local_dir`)**:
+The local filesystem working directory tracked on `widget::SessionOrigin::SavedSsh` so closing the application persists local restart context rather than broken SSH state.
+_Avoid_: Remote CWD guess, dropped tab directory
+
 
